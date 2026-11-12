@@ -12,6 +12,7 @@
     "test": "node --test",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
+    "admin:create": "node --env-file=.env scripts/create-admin.mjs",
     "admin:reset-password": "node --env-file=.env scripts/reset-admin-password.mjs"
   },
   "dependencies": {

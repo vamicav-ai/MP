@@ -1,81 +1,21 @@
-import { createInterface } from "node:readline";
 import bcrypt from "bcryptjs";
-import { Pool, neonConfig } from "@neondatabase/serverless";
-import WebSocket from "ws";
-
-neonConfig.webSocketConstructor = WebSocket;
-
-function readHidden(prompt) {
-  if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    throw new Error("Run this command in an interactive terminal so the password can be entered without echo.");
-  }
-
-  return new Promise((resolve, reject) => {
-    let value = "";
-    const input = process.stdin;
-    const onData = (chunk) => {
-      for (const character of chunk) {
-        if (character === "\u0003") {
-          finish(new Error("Password reset cancelled."));
-          return;
-        }
-        if (character === "\r" || character === "\n") {
-          finish(null, value);
-          return;
-        }
-        if (character === "\u007f" || character === "\b") {
-          value = value.slice(0, -1);
-        } else if (character >= " ") {
-          value += character;
-        }
-      }
-    };
-
-    const finish = (error, result) => {
-      input.off("data", onData);
-      input.setRawMode(false);
-      input.pause();
-      process.stdout.write("\n");
-      if (error) reject(error);
-      else resolve(result);
-    };
-
-    process.stdout.write(prompt);
-    input.setRawMode(true);
-    input.setEncoding("utf8");
-    input.resume();
-    input.on("data", onData);
-  });
-}
+import {
+  createDatabasePool,
+  getConnectionString,
+  promptLine,
+  promptPassword,
+  requireInteractiveTerminal,
+} from "./admin-cli.mjs";
 
 async function main() {
-  if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    throw new Error("Run this command in the VS Code integrated terminal so it can prompt for your admin email and password.");
-  }
-
-  const connectionString = process.env.DATABASE_URL?.trim()
-    || process.env.DATABASE_PATH?.trim();
-  if (!connectionString || !/^postgres(?:ql)?:\/\//i.test(connectionString)) {
-    throw new Error("Set DATABASE_URL to a PostgreSQL connection string in web/.env.");
-  }
-
-  const readline = createInterface({ input: process.stdin, output: process.stdout });
-  let email;
-  try {
-    const answer = await readline.question("Admin email: ");
-    email = typeof answer === "string" ? answer.trim().toLowerCase() : "";
-  } finally {
-    readline.close();
-  }
-  if (!email) throw new Error("No admin email was entered. Keep the terminal open and type it at the prompt.");
+  requireInteractiveTerminal();
+  const connectionString = getConnectionString();
+  const email = (await promptLine("Admin email: ")).toLowerCase();
   if (!email.includes("@")) throw new Error("Enter a valid admin email.");
 
-  const password = await readHidden("New password (minimum 12 characters): ");
-  const confirmation = await readHidden("Confirm new password: ");
-  if (password.length < 12) throw new Error("Password must contain at least 12 characters.");
-  if (password !== confirmation) throw new Error("Passwords do not match.");
+  const password = await promptPassword();
 
-  const pool = new Pool({ connectionString, max: 1 });
+  const pool = createDatabasePool(connectionString);
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
