@@ -1,0 +1,34 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1794508394092,
+      "tag": "0000_grey_revanche",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1794509151349,
+      "tag": "0001_old_pete_wisdom",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1794509308143,
+      "tag": "0002_seed_default_subjects",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1794509926087,
+      "tag": "0003_nifty_silver_centurion",
+      "breakpoints": true
+    }
+  ]
+}
