@@ -49,6 +49,10 @@ function readHidden(prompt) {
 }
 
 async function main() {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error("Run this command in the VS Code integrated terminal so it can prompt for your admin email and password.");
+  }
+
   const connectionString = process.env.DATABASE_URL?.trim()
     || process.env.DATABASE_PATH?.trim();
   if (!connectionString || !/^postgres(?:ql)?:\/\//i.test(connectionString)) {
@@ -58,11 +62,13 @@ async function main() {
   const readline = createInterface({ input: process.stdin, output: process.stdout });
   let email;
   try {
-    email = (await readline.question("Admin email: ")).trim().toLowerCase();
+    const answer = await readline.question("Admin email: ");
+    email = typeof answer === "string" ? answer.trim().toLowerCase() : "";
   } finally {
     readline.close();
   }
-  if (!email || !email.includes("@")) throw new Error("Enter a valid admin email.");
+  if (!email) throw new Error("No admin email was entered. Keep the terminal open and type it at the prompt.");
+  if (!email.includes("@")) throw new Error("Enter a valid admin email.");
 
   const password = await readHidden("New password (minimum 12 characters): ");
   const confirmation = await readHidden("Confirm new password: ");
