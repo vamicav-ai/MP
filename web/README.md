@@ -38,6 +38,8 @@ npm run db:generate
 npm run db:migrate
 ```
 
+To securely reset an existing administrator's password, first ensure the database connection string is current in `web/.env`, then run `npm run admin:reset-password` from `web/`. The command prompts for the admin email and the new password without echoing the password, stores a bcrypt hash, revokes that administrator's active sessions, and writes an audit record. Never pass the password as a command-line argument or commit it.
+
 The Neon connection check passed using the local `.env` setting. Do not copy connection strings into command output, source files, or documentation.
 
 ## Current limitations
