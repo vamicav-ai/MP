@@ -3,16 +3,23 @@ import { ArrowRight, Clapperboard, Plus } from "lucide-react";
 import { PageHeading, PageMessages, StatCard } from "@/components/ui";
 import { requireUser } from "@/lib/auth";
 import { getDb } from "@/lib/db";
+import { countDocuments } from "@/lib/queries";
+import type { ReelSeriesDocument } from "@/lib/models";
 
 export default async function TeacherPage() {
   const user = await requireUser(["teacher"]);
   const db = getDb();
-  const classCount = Number((await db.prepare("SELECT COUNT(*) AS count FROM classes WHERE teacher_id = ?").get(user.id) as { count: number }).count);
-  const seriesCount = Number((await db.prepare("SELECT COUNT(*) AS count FROM reel_series WHERE teacher_id = ?").get(user.id) as { count: number }).count);
-  const published = Number((await db.prepare(`
-    SELECT (SELECT COUNT(*) FROM classes WHERE teacher_id = ? AND published = 1) +
-           (SELECT COUNT(*) FROM reels JOIN reel_series ON reel_series.id = reels.series_id WHERE reel_series.teacher_id = ? AND reels.published = 1) AS count
-  `).get(user.id, user.id) as { count: number }).count);
+  const [classCount, series, publishedClasses] = await Promise.all([
+    countDocuments("classes", { teacher_id: user.id }),
+    db.collection<ReelSeriesDocument>("reel_series").find({ teacher_id: user.id }).toArray(),
+    countDocuments("classes", { teacher_id: user.id, published: 1 }),
+  ]);
+  const seriesIds = series.map((item) => item.id);
+  const publishedReels = seriesIds.length
+    ? await countDocuments("reels", { series_id: { $in: seriesIds }, published: 1 })
+    : 0;
+  const seriesCount = series.length;
+  const published = publishedClasses + publishedReels;
   return (
     <>
       <PageMessages />

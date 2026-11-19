@@ -10,6 +10,7 @@ import {
   LayoutDashboard,
   LibraryBig,
   LogOut,
+  KeyRound,
   ShieldCheck,
   UsersRound,
 } from "lucide-react";
@@ -48,7 +49,7 @@ function linksFor(role: Role) {
 
 export function AppFrame({ user, children }: { user: User; children: React.ReactNode }) {
   const pathname = usePathname();
-  const links = linksFor(user.role);
+  const links = [...linksFor(user.role), { href: "/account", label: "Account", icon: KeyRound }];
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -76,9 +77,6 @@ export function AppFrame({ user, children }: { user: User; children: React.React
           <div className="user-mini">
             <div className="avatar">{user.name.slice(0, 1).toUpperCase()}</div>
             <div className="user-mini-copy"><strong>{user.name}</strong><span>{user.role}</span></div>
-            <form action={signOut}>
-              <button className="icon-button" aria-label="Sign out" title="Sign out"><LogOut size={17} /></button>
-            </form>
           </div>
         </div>
       </aside>
@@ -88,6 +86,9 @@ export function AppFrame({ user, children }: { user: User; children: React.React
           <div className="topbar-right">
             <span className={`role-pill role-${user.role}`}>{user.role}</span>
             <div className="avatar avatar-small">{user.name.slice(0, 1).toUpperCase()}</div>
+            <form action={signOut}>
+              <button className="icon-button" aria-label="Sign out" title="Sign out"><LogOut size={17} /></button>
+            </form>
           </div>
         </header>
         <div className="page-content">{children}</div>

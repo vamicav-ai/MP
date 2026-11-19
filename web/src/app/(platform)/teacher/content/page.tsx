@@ -2,7 +2,7 @@ import { createClass, createReel, createReelSeries, togglePublication } from "@/
 import { EmptyState, Field, PageHeading, PageMessages } from "@/components/ui";
 import { requireUser } from "@/lib/auth";
 import { getDb } from "@/lib/db";
-import { getSubjects } from "@/lib/queries";
+import type { BatchDocument, ClassDocument, ReelDocument, ReelSeriesDocument, SubjectDocument } from "@/lib/models";
 
 type OwnedClass = { id: number; title: string; subject: string; published: number };
 type OwnedSeries = { id: number; title: string; subject: string; published: number; reel_count: number };
@@ -12,31 +12,52 @@ type TeacherSubject = { id: number; name: string };
 export default async function TeacherContentPage() {
   const user = await requireUser(["teacher", "admin"]);
   const db = getDb();
-  const subjects = user.role === "admin" ? await getSubjects() : await db.prepare(`
-    SELECT subjects.id, subjects.name FROM teacher_subjects
-    JOIN subjects ON subjects.id = teacher_subjects.subject_id WHERE teacher_subjects.teacher_id = ? ORDER BY subjects.name
-  `).all(user.id) as TeacherSubject[];
-  const classes = await db.prepare(`
-    SELECT classes.id, classes.title, subjects.name AS subject, classes.published FROM classes
-    JOIN subjects ON subjects.id = classes.subject_id WHERE ${user.role === "admin" ? "1=1" : "classes.teacher_id = ?"}
-    ORDER BY classes.created_at DESC
-  `).all(...(user.role === "admin" ? [] : [user.id])) as OwnedClass[];
-  const series = await db.prepare(`
-    SELECT reel_series.id, reel_series.title, subjects.name AS subject, reel_series.published,
-      COUNT(reels.id) AS reel_count
-    FROM reel_series JOIN subjects ON subjects.id = reel_series.subject_id
-    LEFT JOIN reels ON reels.series_id = reel_series.id
-    WHERE ${user.role === "admin" ? "1=1" : "reel_series.teacher_id = ?"}
-    GROUP BY reel_series.id, reel_series.title, subjects.name, reel_series.published, reel_series.created_at
-    ORDER BY reel_series.created_at DESC
-  `).all(...(user.role === "admin" ? [] : [user.id])) as OwnedSeries[];
-  const reels = await db.prepare(`
-    SELECT reels.id, reels.title, reels.sequence_number, reels.published, reel_series.title AS series
-    FROM reels JOIN reel_series ON reel_series.id = reels.series_id
-    WHERE ${user.role === "admin" ? "1=1" : "reel_series.teacher_id = ?"}
-    ORDER BY reel_series.title, reels.sequence_number
-  `).all(...(user.role === "admin" ? [] : [user.id])) as OwnedReel[];
-  const batches = await db.prepare("SELECT id, title FROM batches WHERE published = 1 ORDER BY title").all() as Array<{ id: number; title: string }>;
+  const [subjectDocs, assignments, classDocs, seriesDocs, reelDocs, batchDocs] = await Promise.all([
+    db.collection<SubjectDocument>("subjects").find({ active: 1 }).sort({ name: 1 }).toArray(),
+    user.role === "admin"
+      ? Promise.resolve([])
+      : db.collection<{ teacher_id: number; subject_id: number }>("teacher_subjects").find({ teacher_id: user.id }).toArray(),
+    db.collection<ClassDocument>("classes")
+      .find(user.role === "admin" ? {} : { teacher_id: user.id }).sort({ created_at: -1 }).toArray(),
+    db.collection<ReelSeriesDocument>("reel_series")
+      .find(user.role === "admin" ? {} : { teacher_id: user.id }).sort({ created_at: -1 }).toArray(),
+    db.collection<ReelDocument>("reels").find().toArray(),
+    db.collection<BatchDocument>("batches").find({ published: 1 }).sort({ title: 1 }).toArray(),
+  ]);
+  const subjects: TeacherSubject[] = (user.role === "admin"
+    ? subjectDocs
+    : subjectDocs.filter((subject) => assignments.some((assignment) => assignment.subject_id === subject.id)))
+    .map(({ id, name }) => ({ id, name }));
+  const subjectNames = new Map(subjectDocs.map((subject) => [subject.id, subject.name]));
+  const seriesNames = new Map(seriesDocs.map((item) => [item.id, item.title]));
+  const reelsBySeries = new Map<number, number>();
+  for (const reel of reelDocs) reelsBySeries.set(reel.series_id, (reelsBySeries.get(reel.series_id) ?? 0) + 1);
+  const classes: OwnedClass[] = classDocs.flatMap((item) => {
+    const subject = subjectNames.get(item.subject_id);
+    return subject ? [{ id: item.id, title: item.title, subject, published: item.published }] : [];
+  });
+  const series: OwnedSeries[] = seriesDocs.flatMap((item) => {
+    const subject = subjectNames.get(item.subject_id);
+    return subject ? [{
+      id: item.id,
+      title: item.title,
+      subject,
+      published: item.published,
+      reel_count: reelsBySeries.get(item.id) ?? 0,
+    }] : [];
+  });
+  const seriesIds = new Set(seriesDocs.map((item) => item.id));
+  const reels: OwnedReel[] = reelDocs.filter((item) => seriesIds.has(item.series_id))
+    .sort((left, right) => (seriesNames.get(left.series_id) ?? "").localeCompare(seriesNames.get(right.series_id) ?? "")
+      || left.sequence_number - right.sequence_number)
+    .map((item) => ({
+      id: item.id,
+      title: item.title,
+      sequence_number: item.sequence_number,
+      published: item.published,
+      series: seriesNames.get(item.series_id) ?? "",
+    }));
+  const batches = batchDocs.map(({ id, title }) => ({ id, title }));
 
   return (
     <>

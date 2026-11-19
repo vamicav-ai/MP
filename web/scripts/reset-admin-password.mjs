@@ -1,7 +1,7 @@
 import bcrypt from "bcryptjs";
 import {
-  createDatabasePool,
-  getConnectionString,
+  connectMongoDatabase,
+  nextId,
   promptLine,
   promptPassword,
   requireInteractiveTerminal,
@@ -9,42 +9,37 @@ import {
 
 async function main() {
   requireInteractiveTerminal();
-  const connectionString = getConnectionString();
   const email = (await promptLine("Admin email: ")).toLowerCase();
   if (!email.includes("@")) throw new Error("Enter a valid admin email.");
 
   const password = await promptPassword();
-
-  const pool = createDatabasePool(connectionString);
-  const client = await pool.connect();
+  const passwordHash = await bcrypt.hash(password, 12);
+  const { client, database } = await connectMongoDatabase();
   try {
-    await client.query("BEGIN");
-    const result = await client.query(
-      "SELECT id FROM users WHERE lower(email) = $1 AND role = 'admin' AND active = 1 FOR UPDATE",
-      [email],
-    );
-    if (result.rowCount !== 1) throw new Error("No active administrator matches that email.");
+    await client.withSession(async (session) => {
+      await session.withTransaction(async () => {
+        const users = database.collection("users");
+        const admin = await users.findOne({ email_key: email, role: "admin", active: 1 }, { session });
+        if (!admin) throw new Error("No active administrator matches that email.");
 
-    const userId = result.rows[0].id;
-    const passwordHash = await bcrypt.hash(password, 12);
-    await client.query("UPDATE users SET password_hash = $1 WHERE id = $2", [passwordHash, userId]);
-    await client.query("DELETE FROM sessions WHERE user_id = $1", [userId]);
-    await client.query(
-      "INSERT INTO audit_logs (actor_id, action, details) VALUES (NULL, 'admin.password_reset.cli', $1)",
-      [`user_id=${userId}`],
-    );
-    await client.query("COMMIT");
+        await users.updateOne({ id: admin.id }, { $set: { password_hash: passwordHash } }, { session });
+        await database.collection("sessions").deleteMany({ user_id: admin.id }, { session });
+        await database.collection("audit_logs").insertOne({
+          id: await nextId(database, "audit_logs", session),
+          actor_id: null,
+          action: "admin.password_reset.cli",
+          details: `user_id=${admin.id}`,
+          created_at: new Date(),
+        }, { session });
+      });
+    });
     console.log("Admin password updated. Sign in with the new password; previous sessions were revoked.");
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
   } finally {
-    client.release();
-    await pool.end();
+    await client.close();
   }
 }
 
 main().catch((error) => {
-  console.error(error instanceof Error ? error.message : "Admin password reset failed.");
+  console.error(error instanceof Error ? error.message : "Administrator password reset failed.");
   process.exitCode = 1;
 });

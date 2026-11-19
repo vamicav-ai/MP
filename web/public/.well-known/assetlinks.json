@@ -1,0 +1,8 @@
+[{
+      "relation": ["delegate_permission/common.handle_all_urls"],
+      "target": {
+        "namespace": "android_app",
+        "package_name": "com.vamicav.edureels",
+        "sha256_cert_fingerprints": ["48:27:B4:E8:34:81:68:AA:6E:0F:24:4B:F0:53:08:91:43:AD:C9:FE:CD:24:1C:4A:0F:DE:12:07:01:20:A7:9F"]
+      }
+    }]

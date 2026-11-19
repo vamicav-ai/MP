@@ -3,6 +3,7 @@ import { EmptyState, Field, PageHeading, PageMessages, SubjectChoices } from "@/
 import { requireUser } from "@/lib/auth";
 import { getDb } from "@/lib/db";
 import { getSubjects } from "@/lib/queries";
+import type { SubjectDocument, UserDocument } from "@/lib/models";
 
 type Teacher = { id: number; name: string; email: string; mobile: string; active: number; subjects: string };
 
@@ -10,13 +11,27 @@ export default async function AdminTeachersPage() {
   await requireUser(["admin"]);
   const db = getDb();
   const subjects = await getSubjects();
-  const teachers = await db.prepare(`
-    SELECT users.id, users.name, users.email, users.mobile, users.active,
-      COALESCE(group_concat(subjects.name, ', '), '') AS subjects
-    FROM users LEFT JOIN teacher_subjects ON teacher_subjects.teacher_id = users.id
-    LEFT JOIN subjects ON subjects.id = teacher_subjects.subject_id
-    WHERE users.role = 'teacher' GROUP BY users.id ORDER BY users.created_at DESC
-  `).all() as Teacher[];
+  const [teacherDocs, assignments, subjectDocs] = await Promise.all([
+    db.collection<UserDocument>("users").find({ role: "teacher" }).sort({ created_at: -1 }).toArray(),
+    db.collection<{ teacher_id: number; subject_id: number }>("teacher_subjects").find().toArray(),
+    db.collection<SubjectDocument>("subjects").find().toArray(),
+  ]);
+  const subjectNames = new Map(subjectDocs.map((subject) => [subject.id, subject.name]));
+  const subjectIdsByTeacher = new Map<number, number[]>();
+  for (const assignment of assignments) {
+    subjectIdsByTeacher.set(assignment.teacher_id, [...(subjectIdsByTeacher.get(assignment.teacher_id) ?? []), assignment.subject_id]);
+  }
+  const teachers: Teacher[] = teacherDocs.map((teacher) => ({
+    id: teacher.id,
+    name: teacher.name,
+    email: teacher.email,
+    mobile: teacher.mobile,
+    active: teacher.active,
+    subjects: (subjectIdsByTeacher.get(teacher.id) ?? [])
+      .map((id) => subjectNames.get(id))
+      .filter((name): name is string => Boolean(name))
+      .join(", "),
+  }));
   return (
     <>
       <PageMessages />

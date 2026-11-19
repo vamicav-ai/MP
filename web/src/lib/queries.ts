@@ -1,6 +1,13 @@
 import "server-only";
 
-import { getDb } from "@/lib/db";
+import type { Filter } from "mongodb";
+import { getDb, initializeDatabase } from "@/lib/db";
+import type {
+  BatchDocument,
+  EnrollmentDocument,
+  OfflinePaymentDocument,
+  SubjectDocument,
+} from "@/lib/models";
 
 export type Subject = { id: number; name: string; description: string };
 export type Batch = {
@@ -16,31 +23,46 @@ export type Batch = {
 };
 
 export async function getSubjects(): Promise<Subject[]> {
-  return await getDb()
-    .prepare("SELECT id, name, description FROM subjects WHERE active = 1 ORDER BY name")
-    .all() as Subject[];
+  await initializeDatabase();
+  return getDb().collection<SubjectDocument>("subjects")
+    .find({ active: 1 }, { projection: { _id: 0, id: 1, name: 1, description: 1 } })
+    .sort({ name: 1 })
+    .toArray();
 }
 
 export async function getBatches(studentId?: number): Promise<Batch[]> {
-  const rows = await getDb().prepare(`
-    SELECT batches.id, batches.title, batches.description, batches.price_paise, batches.is_free,
-      batches.published, COALESCE(group_concat(subjects.name, ', '), '') AS subjects
-    FROM batches
-    LEFT JOIN batch_subjects ON batch_subjects.batch_id = batches.id
-    LEFT JOIN subjects ON subjects.id = batch_subjects.subject_id
-    WHERE batches.published = 1
-    GROUP BY batches.id
-    ORDER BY batches.created_at DESC
-  `).all() as Batch[];
-  if (!studentId) return rows;
-  return Promise.all(rows.map(async (batch) => {
-    const [enrollment, payment] = await Promise.all([
-      getDb().prepare("SELECT status FROM enrollments WHERE student_id = ? AND batch_id = ?")
-        .get(studentId, batch.id) as Promise<{ status: string } | undefined>,
-      getDb().prepare("SELECT status FROM offline_payment_requests WHERE student_id = ? AND batch_id = ?")
-        .get(studentId, batch.id) as Promise<{ status: string } | undefined>,
-    ]);
-    return { ...batch, enrollment_status: enrollment?.status, payment_status: payment?.status };
+  await initializeDatabase();
+  const database = getDb();
+  const [batches, links, subjects, enrollments, payments] = await Promise.all([
+    database.collection<BatchDocument>("batches").find({ published: 1 }).sort({ created_at: -1 }).toArray(),
+    database.collection<{ batch_id: number; subject_id: number }>("batch_subjects").find().toArray(),
+    database.collection<SubjectDocument>("subjects").find().toArray(),
+    studentId
+      ? database.collection<EnrollmentDocument>("enrollments").find({ student_id: studentId }).toArray()
+      : Promise.resolve([] as EnrollmentDocument[]),
+    studentId
+      ? database.collection<OfflinePaymentDocument>("offline_payment_requests").find({ student_id: studentId }).toArray()
+      : Promise.resolve([] as OfflinePaymentDocument[]),
+  ]);
+  const subjectNames = new Map(subjects.map((subject) => [subject.id, subject.name]));
+  const subjectsByBatch = new Map<number, string[]>();
+  for (const link of links) {
+    const name = subjectNames.get(link.subject_id);
+    if (name) subjectsByBatch.set(link.batch_id, [...(subjectsByBatch.get(link.batch_id) ?? []), name]);
+  }
+  const enrollmentByBatch = new Map(enrollments.map((item) => [item.batch_id, item.status]));
+  const paymentByBatch = new Map(payments.map((item) => [item.batch_id, item.status]));
+
+  return batches.map((batch) => ({
+    id: batch.id,
+    title: batch.title,
+    description: batch.description,
+    price_paise: batch.price_paise,
+    is_free: batch.is_free,
+    published: batch.published,
+    subjects: (subjectsByBatch.get(batch.id) ?? []).join(", "),
+    enrollment_status: enrollmentByBatch.get(batch.id),
+    payment_status: paymentByBatch.get(batch.id),
   }));
 }
 
@@ -52,15 +74,19 @@ export function money(paise: number): string {
   }).format(paise / 100);
 }
 
-export async function countRows(query: string): Promise<number> {
-  const row = await getDb().prepare(query).get() as { count: number | string };
-  return Number(row.count);
+export async function countDocuments(
+  collectionName: string,
+  filter: Filter<object> = {},
+): Promise<number> {
+  await initializeDatabase();
+  return getDb().collection(collectionName).countDocuments(filter);
 }
 
 export async function canStudentAccessBatch(studentId: number, batchId: number | null): Promise<boolean> {
   if (batchId === null) return true;
+  await initializeDatabase();
   return Boolean(
-    await getDb().prepare("SELECT 1 FROM enrollments WHERE student_id = ? AND batch_id = ? AND status = 'active'")
-      .get(studentId, batchId),
+    await getDb().collection<EnrollmentDocument>("enrollments")
+      .findOne({ student_id: studentId, batch_id: batchId, status: "active" }),
   );
 }

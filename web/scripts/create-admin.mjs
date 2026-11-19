@@ -1,19 +1,15 @@
 import bcrypt from "bcryptjs";
 import {
-  createDatabasePool,
-  getConnectionString,
+  connectMongoDatabase,
+  isUniqueViolation,
+  nextId,
   promptLine,
   promptPassword,
   requireInteractiveTerminal,
 } from "./admin-cli.mjs";
 
-function isUniqueViolation(error) {
-  return typeof error === "object" && error !== null && "code" in error && error.code === "23505";
-}
-
 async function main() {
   requireInteractiveTerminal();
-  const connectionString = getConnectionString();
   const name = await promptLine("Admin full name: ");
   const email = (await promptLine("Admin email: ")).toLowerCase();
   const mobile = await promptLine("Admin mobile: ");
@@ -21,38 +17,42 @@ async function main() {
 
   const password = await promptPassword("Admin password (minimum 12 characters): ");
   const passwordHash = await bcrypt.hash(password, 12);
-  const pool = createDatabasePool(connectionString);
-  const client = await pool.connect();
+  const { client, database } = await connectMongoDatabase();
   try {
-    await client.query("BEGIN");
-    const existing = await client.query(
-      "SELECT id FROM users WHERE role = 'admin' AND active = 1 LIMIT 1 FOR UPDATE",
-    );
-    if (existing.rowCount) {
-      throw new Error("An active administrator already exists. Use npm run admin:reset-password instead.");
-    }
+    await client.withSession(async (session) => {
+      await session.withTransaction(async () => {
+        const users = database.collection("users");
+        if (await users.findOne({ role: "admin", active: 1 }, { session })) {
+          throw new Error("An active administrator already exists. Use npm run admin:reset-password instead.");
+        }
 
-    const created = await client.query(
-      `INSERT INTO users (name, email, mobile, password_hash, email_verified, role, active)
-       VALUES ($1, $2, $3, $4, 1, 'admin', 1) RETURNING id`,
-      [name, email, mobile, passwordHash],
-    );
-    const userId = created.rows[0].id;
-    await client.query(
-      "INSERT INTO audit_logs (actor_id, action, details) VALUES (NULL, 'admin.created.cli', $1)",
-      [`user_id=${userId}`],
-    );
-    await client.query("COMMIT");
+        const userId = await nextId(database, "users", session);
+        await users.insertOne({
+          id: userId,
+          name,
+          email,
+          email_key: email,
+          mobile,
+          password_hash: passwordHash,
+          role: "admin",
+          active: 1,
+          created_at: new Date(),
+        }, { session });
+        await database.collection("audit_logs").insertOne({
+          id: await nextId(database, "audit_logs", session),
+          actor_id: null,
+          action: "admin.created.cli",
+          details: `user_id=${userId}`,
+          created_at: new Date(),
+        }, { session });
+      });
+    });
     console.log("Administrator created. Sign in with the email or mobile number and password you entered.");
   } catch (error) {
-    await client.query("ROLLBACK");
-    if (isUniqueViolation(error)) {
-      throw new Error("That email or mobile number is already in use.");
-    }
+    if (isUniqueViolation(error)) throw new Error("That email is already in use.");
     throw error;
   } finally {
-    client.release();
-    await pool.end();
+    await client.close();
   }
 }
 

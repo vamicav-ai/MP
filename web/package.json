@@ -10,18 +10,16 @@
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
     "test": "node --test",
-    "db:generate": "drizzle-kit generate",
-    "db:migrate": "drizzle-kit migrate",
+    "db:migrate": "node --env-file=.env scripts/migrate-postgres-to-mongodb.mjs",
     "admin:create": "node --env-file=.env scripts/create-admin.mjs",
-    "admin:reset-password": "node --env-file=.env scripts/reset-admin-password.mjs"
+    "admin:reset-password": "node --env-file=.env scripts/reset-admin-password.mjs",
+    "test:atlas": "node scripts/run-atlas-integration.mjs"
   },
   "dependencies": {
-    "@neondatabase/serverless": "^1.2.0",
     "bcryptjs": "^3.0.3",
-    "drizzle-orm": "^0.45.4",
     "lucide-react": "^1.72.0",
+    "mongodb": "^6.22.0",
     "next": "16.4.6",
-    "nodemailer": "^10.5.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "ws": "^8.22.2"
@@ -29,13 +27,12 @@
   "devDependencies": {
     "@tailwindcss/turbopack": "4.3.3",
     "@types/node": "^20",
-    "@types/nodemailer": "^8.0.2",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@types/ws": "^8.18.2",
-    "drizzle-kit": "^0.31.11",
     "eslint": "^9",
     "eslint-config-next": "16.4.6",
+    "pg": "^8.23.1",
     "tailwindcss": "4.3.3",
     "typescript": "^5"
   }

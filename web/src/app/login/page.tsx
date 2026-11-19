@@ -2,7 +2,8 @@ import Link from "next/link";
 import { redirect } from "next/navigation";
 import { signIn } from "@/lib/actions";
 import { getCurrentUser } from "@/lib/auth";
-import { getDb } from "@/lib/db";
+import { initializeDatabase } from "@/lib/db";
+import { countDocuments } from "@/lib/queries";
 import { Field, PageMessages } from "@/components/ui";
 
 export const runtime = "nodejs";
@@ -10,7 +11,8 @@ export const dynamic = "force-dynamic";
 
 export default async function LoginPage() {
   if (await getCurrentUser()) redirect("/dashboard");
-  const count = Number((await getDb().prepare("SELECT COUNT(*) AS count FROM users").get() as { count: number | string }).count);
+  await initializeDatabase();
+  const count = await countDocuments("users");
   if (!count) redirect("/setup");
   return (
     <main className="auth-page">
@@ -28,7 +30,7 @@ export default async function LoginPage() {
           <button className="button button-primary button-full" type="submit">Sign in <span>→</span></button>
         </form>
         <p className="auth-switch">New to EduReels? <Link href="/register">Create a student account</Link></p>
-        <p className="auth-footnote"><Link href="/forgot-password">Forgot your password?</Link></p>
+        <p className="auth-footnote"><Link href="/forgot-password">Forgot your password? Contact an administrator.</Link></p>
       </section>
       <div className="auth-caption">LEARN SOMETHING NEW, EVERY DAY.</div>
     </main>

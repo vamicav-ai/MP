@@ -19,7 +19,8 @@ This specification is intended to be self-contained so a new developer or team c
 
 ### Student
 
-- Register, verify email, sign in/out, and recover a password.
+- Register, sign in/out, and change a password while signed in.
+- If a student forgets their current password, contact an administrator for a password reset; no email-based recovery is provided.
 - Choose and update subjects of interest.
 - Browse batches and see whether each is free or paid.
 - Join a free batch immediately.
@@ -54,7 +55,7 @@ The first administrator must be provisioned through a documented, secure setup p
 ### 4.1 Student onboarding
 
 1. Student registers with full name, email, mobile number, and password.
-2. Student verifies their email and signs in.
+2. The account is created and the student is signed in without email verification.
 3. Student selects one or more subjects; they can change these later.
 4. Student lands on a dashboard with relevant subjects, batches, and learning progress.
 
@@ -108,8 +109,10 @@ The application does not collect money online in the first release. Do not show 
 
 - Registration fields: full name, email, mobile number, password, and password confirmation.
 - Sign in using email or mobile number and password; provide logout and session persistence.
-- Email verification and expiring, single-use password reset links.
-- Store only securely hashed passwords; use secure session cookies and rate limits for authentication and recovery.
+- Let signed-in users change their password by confirming their current password.
+- Administrators can reset a student's password; revoke that student's active sessions and audit the action. Students who forget their password must contact an administrator.
+- Do not send email or implement email verification or email-based password recovery.
+- Store only securely hashed passwords; use secure session cookies and rate limits for authentication.
 - Enforce role checks on the server for every protected operation.
 
 ### Subjects and batches
@@ -125,7 +128,7 @@ The application does not collect money online in the first release. Do not show 
 - Classes contain a title, description, subject/topic, teacher owner, sequence or grouping metadata as needed, video reference, publication state, and timestamps.
 - Students see and play only published classes they are entitled to view.
 - Save playback position and completion/progress state so students can continue later.
-- Video bytes are hosted by a dedicated video service, not stored in PostgreSQL.
+- Video bytes are hosted by a dedicated video service, not stored in MongoDB.
 
 ### Educational reels
 
@@ -150,7 +153,7 @@ The application does not collect money online in the first release. Do not show 
 
 - Admin screens: overview, students, teachers, active sessions, subjects, batches, classes, reels, pending payments, and basic analytics.
 - Basic analytics can include counts of students, active students, batches, published classes/reels, enrollments, reel views/completions, and verified offline collections.
-- Notify students when relevant enrollment/payment status changes; email/push delivery requires a configured provider.
+- Show relevant enrollment/payment status updates as in-app notifications only; do not send email or push notifications.
 - Record important actions such as account/role changes, payment decisions, progress resets, and content publication changes.
 
 ## 6. Page map
@@ -162,7 +165,8 @@ The application does not collect money online in the first release. Do not show 
 | Home | `/` |
 | Register | `/register` |
 | Login | `/login` |
-| Forgot/reset password | `/forgot-password`, `/reset-password` |
+| Account security | `/account` |
+| Forgotten password help | `/forgot-password` |
 | Student dashboard | `/dashboard` |
 | Browse batches | `/batches` |
 | Batch details | `/batches/[id]` |
@@ -202,14 +206,13 @@ Routes are illustrative. The implementation may group screens differently while 
 
 ## 7. Data model outline
 
-Use PostgreSQL with foreign keys, indexes, and uniqueness constraints. Exact columns and authentication tables should follow the selected auth library and implementation.
+Use MongoDB Atlas collections with unique and supporting indexes. Store relationships as validated numeric IDs and use Atlas transactions for multi-document operations that must commit together.
 
 | Entity/table | Purpose |
 |---|---|
 | `users` | Student, teacher, and administrator identities and role/status |
 | `sessions` | Authenticated sessions |
 | `active_device_sessions` | Student's registered active installation/session |
-| `password_reset_tokens` | Expiring password recovery tokens |
 | `subjects` | Subject catalog |
 | `student_subjects` | Student subject selections |
 | `batches` | Free/paid learning groups |
@@ -224,7 +227,7 @@ Use PostgreSQL with foreign keys, indexes, and uniqueness constraints. Exact col
 | `notifications` | In-app notifications |
 | `audit_logs` | Important administrative and security events |
 
-Use unique constraints for student enrollment per batch, student/reel progress, and reel sequence within a series. A payment confirmation and its enrollment change must be handled transactionally or with an equivalent safe, retryable process.
+Use unique indexes for student enrollment per batch, student/reel progress, and reel sequence within a series. A payment confirmation and its enrollment change must be handled transactionally or with an equivalent safe, retryable process. Preserve numeric IDs and relationships when importing existing PostgreSQL records.
 
 ## 8. Suggested architecture and technology
 
@@ -235,8 +238,8 @@ The initial proposal is:
 | Web application | Next.js, TypeScript |
 | UI | Tailwind CSS and accessible reusable components |
 | Server | Next.js server actions/API routes with server-side authorization |
-| Database | Neon PostgreSQL |
-| ORM/migrations | Drizzle ORM |
+| Database | MongoDB Atlas |
+| Data access/migrations | MongoDB Node.js driver, indexed collections, and an idempotent PostgreSQL-to-Atlas importer |
 | Authentication | Better Auth, subject to validating role and session requirements |
 | Password hashing | Use the authentication library's supported secure password hashing; never store plaintext |
 | Video | Cloudflare Stream or another selected streaming host |
@@ -251,7 +254,7 @@ Keep the stack in one web application for the initial release. Store video refer
 ### Release 1 — Core platform with offline collections
 
 - Responsive web application/PWA foundation.
-- Student registration, login, verification, recovery, and role-protected sessions.
+- Student registration, login, password changes, administrator-assisted recovery, and role-protected sessions.
 - Administrator-created teacher accounts.
 - Subject and batch management; free enrollment.
 - Paid batch request and administrator verification of offline payment.
@@ -282,7 +285,7 @@ A React Native or other native client may be built later against the same backen
 
 The first release is not complete until all of the following hold:
 
-1. A student can register, verify their account, sign in, reset a forgotten password, and sign out.
+1. A student can register and sign in without email, change their password using their current password, ask an administrator for a reset if necessary, and sign out.
 2. Student, teacher, and administrator permissions are enforced server-side.
 3. An administrator can create a teacher; that teacher can publish an assigned-subject class and reel.
 4. A student can choose subjects and browse relevant published content.
@@ -299,8 +302,8 @@ The first release is not complete until all of the following hold:
 
 - Hash passwords and protect sessions with secure cookie settings appropriate to the deployment.
 - Apply server-side authorization to every protected page and mutation.
-- Keep database, email, video, and future payment credentials in environment variables/secrets management.
-- Rate-limit login and password recovery; avoid revealing whether an email address is registered.
+- Keep database, video, and future payment credentials in environment variables/secrets management.
+- Rate-limit login and password changes; require the current password for self-service changes and audit administrator resets.
 - Validate and authorize upload operations and never expose provider secrets to the browser.
 - Restrict video playback to entitled users using provider access controls/signed playback where available.
 - Validate progress and payment state transitions on the server.
@@ -313,8 +316,7 @@ The first release is not complete until all of the following hold:
 
 The platform can be developed with local configuration, but launch requires selecting and configuring relevant services:
 
-- PostgreSQL/Neon project and database connection string.
-- Email delivery service for verification and password recovery.
+- MongoDB Atlas project, database user, authorized network access, and connection string. Importing existing PostgreSQL records additionally requires a read-accessible source connection string.
 - Video hosting/streaming provider and credentials.
 - Hosting provider, domain, and production environment configuration.
 - Offline payment instructions and a documented administrator verification process.

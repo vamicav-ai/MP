@@ -1,11 +1,24 @@
 "use server";
 
 import bcrypt from "bcryptjs";
-import { createHash, randomBytes } from "node:crypto";
 import { redirect } from "next/navigation";
 import { clearSession, getCurrentUser, requireUser, startSession } from "@/lib/auth";
-import { getDb } from "@/lib/db";
-import { sendPasswordResetEmail, sendVerificationEmail } from "@/lib/email";
+import { getDb, initializeDatabase, nextId, withTransaction } from "@/lib/db";
+import type {
+  AuditLogDocument,
+  BatchDocument,
+  ClassDocument,
+  ClassProgressDocument,
+  EnrollmentDocument,
+  NotificationDocument,
+  OfflinePaymentDocument,
+  ReelDocument,
+  ReelProgressDocument,
+  ReelSeriesDocument,
+  SessionDocument,
+  SubjectDocument,
+  UserDocument,
+} from "@/lib/models";
 import { calculateReelProgress } from "@/lib/reel-progress";
 
 function message(path: string, value: string, key = "notice"): never {
@@ -21,37 +34,65 @@ function positiveInt(value: string): number | null {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
-function hashToken(token: string): string {
-  return createHash("sha256").update(token).digest("hex");
-}
-
 function isUniqueViolation(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === "23505";
+  return typeof error === "object" && error !== null && "code" in error && error.code === 11000;
 }
 
 async function audit(actorId: number, action: string, details: string): Promise<void> {
-  await getDb().prepare("INSERT INTO audit_logs (actor_id, action, details) VALUES (?, ?, ?)").run(actorId, action, details);
+  await initializeDatabase();
+  await getDb().collection<AuditLogDocument>("audit_logs").insertOne({
+    id: await nextId("audit_logs"),
+    actor_id: actorId,
+    action,
+    details,
+    created_at: new Date(),
+  });
 }
 
 async function hasBatchAccess(studentId: number, batchId: number | null): Promise<boolean> {
   if (batchId === null) return true;
-  return Boolean(
-    await getDb()
-      .prepare("SELECT 1 FROM enrollments WHERE student_id = ? AND batch_id = ? AND status = 'active'")
-      .get(studentId, batchId),
-  );
+  await initializeDatabase();
+  return Boolean(await getDb().collection<EnrollmentDocument>("enrollments")
+    .findOne({ student_id: studentId, batch_id: batchId, status: "active" }));
 }
 
 async function teacherOwnsSubject(userId: number, role: string, subjectId: number): Promise<boolean> {
-  return role === "admin" || Boolean(
-    await getDb().prepare("SELECT 1 FROM teacher_subjects WHERE teacher_id = ? AND subject_id = ?").get(userId, subjectId),
-  );
+  if (role === "admin") return true;
+  await initializeDatabase();
+  return Boolean(await getDb().collection("teacher_subjects").findOne({
+    teacher_id: userId,
+    subject_id: subjectId,
+  }));
+}
+
+async function activateEnrollment(studentId: number, batchId: number, session?: import("mongodb").ClientSession): Promise<void> {
+  const database = getDb();
+  const enrollments = database.collection<EnrollmentDocument>("enrollments");
+  const id = await nextId("enrollments", session);
+  try {
+    await enrollments.updateOne(
+      { student_id: studentId, batch_id: batchId },
+      {
+        $set: { status: "active" },
+        $setOnInsert: { id, created_at: new Date() },
+      },
+      { upsert: true, session },
+    );
+  } catch (error) {
+    if (!isUniqueViolation(error)) throw error;
+    await enrollments.updateOne(
+      { student_id: studentId, batch_id: batchId },
+      { $set: { status: "active" } },
+      { session },
+    );
+  }
 }
 
 export async function provisionFirstAdmin(data: FormData): Promise<void> {
-  const db = getDb();
-  const hasUsers = Number((await db.prepare("SELECT COUNT(*) AS count FROM users").get() as { count: number }).count) > 0;
-  if (hasUsers) message("/setup", "Initial setup has already been completed.", "error");
+  await initializeDatabase();
+  const database = getDb();
+  const users = database.collection<UserDocument>("users");
+  if (await users.countDocuments() > 0) message("/setup", "Initial setup has already been completed.", "error");
 
   const name = text(data, "name");
   const email = text(data, "email").toLowerCase();
@@ -64,17 +105,32 @@ export async function provisionFirstAdmin(data: FormData): Promise<void> {
   const passwordHash = await bcrypt.hash(password, 12);
   let adminId: number;
   try {
-    adminId = await db.transaction(async (tx) => {
-      if (Number((await tx.prepare("SELECT COUNT(*) AS count FROM users").get() as { count: number }).count) > 0) {
-        throw new Error("Initial setup has already been completed.");
-      }
-      const result = await tx.prepare("INSERT INTO users (name, email, mobile, password_hash, email_verified, role) VALUES (?, ?, ?, ?, 1, 'admin') RETURNING id")
-        .get(name, email, mobile, passwordHash) as { id: number };
-      return result.id;
+    adminId = await withTransaction(async (session) => {
+      if (await users.countDocuments({}, { session }) > 0) throw new Error("Initial setup has already been completed.");
+      const id = await nextId("users", session);
+      await users.insertOne({
+        id,
+        name,
+        email,
+        email_key: email,
+        mobile,
+        password_hash: passwordHash,
+        role: "admin",
+        active: 1,
+        created_at: new Date(),
+      }, { session });
+      await database.collection<{ _id: string; user_id: number }>("settings")
+        .insertOne({ _id: "first-admin", user_id: id }, { session });
+      return id;
     });
   } catch (error) {
     if (isUniqueViolation(error)) {
-      message("/setup", "That email is already in use.", "error");
+      const existing = await users.findOne({ email_key: email });
+      if (existing) message("/setup", "That email is already in use.", "error");
+      message("/setup", "Initial setup has already been completed.", "error");
+    }
+    if (error instanceof Error && error.message === "Initial setup has already been completed.") {
+      message("/setup", error.message, "error");
     }
     throw error;
   }
@@ -84,6 +140,7 @@ export async function provisionFirstAdmin(data: FormData): Promise<void> {
 }
 
 export async function registerStudent(data: FormData): Promise<void> {
+  await initializeDatabase();
   const name = text(data, "name");
   const email = text(data, "email").toLowerCase();
   const mobile = text(data, "mobile");
@@ -93,48 +150,42 @@ export async function registerStudent(data: FormData): Promise<void> {
     message("/register", "Enter valid details, use a password of at least 10 characters, and confirm it.", "error");
   }
 
-  const db = getDb();
-  const token = randomBytes(32).toString("base64url");
+  const database = getDb();
   let userId: number;
   try {
-    userId = await db.transaction(async (tx) => {
-      const result = await tx
-        .prepare("INSERT INTO users (name, email, mobile, password_hash, role) VALUES (?, ?, ?, ?, 'student') RETURNING id")
-        .get(name, email, mobile, await bcrypt.hash(password, 12)) as { id: number };
-      await tx.prepare("INSERT INTO verification_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)")
-        .run(result.id, hashToken(token), new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString());
-      return result.id;
+    userId = await withTransaction(async (session) => {
+      const id = await nextId("users", session);
+      await database.collection<UserDocument>("users").insertOne({
+        id,
+        name,
+        email,
+        email_key: email,
+        mobile,
+        password_hash: await bcrypt.hash(password, 12),
+        role: "student",
+        active: 1,
+        created_at: new Date(),
+      }, { session });
+      return id;
     });
   } catch (error) {
-    if (isUniqueViolation(error)) {
-      message("/register", "An account with that email already exists.", "error");
-    }
+    if (isUniqueViolation(error)) message("/register", "An account with that email already exists.", "error");
     throw error;
   }
-  try {
-    await sendVerificationEmail(email, name, token);
-  } catch (error) {
-    await db.prepare("DELETE FROM users WHERE id = ? AND email_verified = 0").run(userId);
-    if (error instanceof Error && error.message.startsWith("SMTP_")) {
-      message("/register", "Email delivery is not configured. Contact the platform administrator before registering.", "error");
-    }
-    throw error;
-  }
-  message("/login", "Check your email for a verification link before signing in.");
+  await startSession(userId, "student");
+  message("/dashboard", "Your account is ready. Welcome to EduReels.");
 }
 
 export async function signIn(data: FormData): Promise<void> {
+  await initializeDatabase();
   const identifier = text(data, "identifier").toLowerCase();
   const password = text(data, "password");
-  const user = await getDb()
-    .prepare("SELECT id, password_hash, role, active, email_verified FROM users WHERE lower(email) = ? OR mobile = ?")
-    .get(identifier, identifier) as { id: number; password_hash: string; role: "student" | "teacher" | "admin"; active: number; email_verified: number } | undefined;
+  const user = await getDb().collection<UserDocument>("users")
+    .findOne({ $or: [{ email_key: identifier }, { mobile: identifier }] });
 
   if (!user || !user.active || !(await bcrypt.compare(password, user.password_hash))) {
     message("/login", "Email/mobile or password is incorrect.", "error");
   }
-  if (!user.email_verified) message("/login", "Verify your email address before signing in.", "error");
-
   try {
     await startSession(user.id, user.role);
   } catch (error) {
@@ -151,101 +202,46 @@ export async function signOut(): Promise<void> {
   redirect("/login");
 }
 
-export async function verifyEmail(data: FormData): Promise<void> {
-  const token = text(data, "token");
-  if (token.length < 20 || token.length > 200) message("/verify-email", "This verification link is invalid or expired.", "error");
-
-  const db = getDb();
-  const userId = await db.transaction(async (tx) => {
-    const verification = await tx.prepare(`
-      SELECT id, user_id FROM verification_tokens
-      WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > now()
-    `).get(hashToken(token)) as { id: number; user_id: number } | undefined;
-    if (!verification) return null;
-
-    const consumed = await tx.prepare(`
-      UPDATE verification_tokens SET consumed_at = now()
-      WHERE id = ? AND consumed_at IS NULL AND expires_at > now()
-      RETURNING user_id
-    `).get(verification.id) as { user_id: number } | undefined;
-    if (!consumed) return null;
-    await tx.prepare("UPDATE users SET email_verified = 1 WHERE id = ?").run(consumed.user_id);
-    return consumed.user_id;
-  });
-  if (!userId) message("/verify-email", "This verification link is invalid or expired.", "error");
-  message("/login", "Your email is verified. You can now sign in.");
-}
-
-export async function requestPasswordReset(data: FormData): Promise<void> {
-  const email = text(data, "email").toLowerCase();
-  if (!email.includes("@")) message("/forgot-password", "Enter a valid email address.", "error");
-
-  const db = getDb();
-  const user = await db.prepare("SELECT id, name FROM users WHERE lower(email) = ? AND active = 1")
-    .get(email) as { id: number; name: string } | undefined;
-  if (user) {
-    const token = randomBytes(32).toString("base64url");
-    const tokenHash = hashToken(token);
-    await db.transaction(async (tx) => {
-      await tx.prepare("DELETE FROM password_reset_tokens WHERE user_id = ? AND consumed_at IS NULL").run(user.id);
-      await tx.prepare("INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)")
-        .run(user.id, tokenHash, new Date(Date.now() + 60 * 60 * 1000).toISOString());
-    });
-    try {
-      await sendPasswordResetEmail(email, user.name, token);
-    } catch (error) {
-      await db.prepare("DELETE FROM password_reset_tokens WHERE token_hash = ?").run(tokenHash);
-      if (error instanceof Error && error.message.startsWith("SMTP_")) {
-        message("/forgot-password", "Email delivery is not configured. Contact the platform administrator for help.", "error");
-      }
-      throw error;
-    }
-  }
-  message("/forgot-password", "If an active account uses that email, password reset instructions have been sent.");
-}
-
-export async function resetPassword(data: FormData): Promise<void> {
-  const token = text(data, "token");
-  const password = text(data, "password");
+export async function changeOwnPassword(data: FormData): Promise<void> {
+  const user = await requireUser();
+  const currentPassword = text(data, "currentPassword");
+  const newPassword = text(data, "newPassword");
   const confirmation = text(data, "confirmPassword");
-  if (token.length < 20 || token.length > 200 || password.length < 10 || password !== confirmation) {
-    message(`/reset-password?token=${encodeURIComponent(token)}`, "Use a valid link, a password of at least 10 characters, and matching confirmation.", "error");
+  if (!currentPassword || newPassword.length < 10 || newPassword !== confirmation) {
+    message("/account", "Enter your current password, use a new password of at least 10 characters, and confirm it.", "error");
   }
 
-  const db = getDb();
-  const passwordHash = await bcrypt.hash(password, 12);
-  const userId = await db.transaction(async (tx) => {
-    const reset = await tx.prepare(`
-      SELECT id, user_id FROM password_reset_tokens
-      WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > now()
-    `).get(hashToken(token)) as { id: number; user_id: number } | undefined;
-    if (!reset) return null;
-    const consumed = await tx.prepare(`
-      UPDATE password_reset_tokens SET consumed_at = now()
-      WHERE id = ? AND consumed_at IS NULL AND expires_at > now()
-      RETURNING user_id
-    `).get(reset.id) as { user_id: number } | undefined;
-    if (!consumed) return null;
-    await tx.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(passwordHash, consumed.user_id);
-    await tx.prepare("DELETE FROM sessions WHERE user_id = ?").run(consumed.user_id);
-    return consumed.user_id;
-  });
-  if (!userId) message("/forgot-password", "This password reset link is invalid or expired. Request a new one.");
-  message("/login", "Your password has been reset. Sign in with your new password.");
+  const database = getDb();
+  const users = database.collection<UserDocument>("users");
+  const account = await users.findOne({ id: user.id }, { projection: { password_hash: 1 } });
+  if (!account || !(await bcrypt.compare(currentPassword, account.password_hash))) {
+    message("/account", "Your current password is incorrect.", "error");
+  }
+  if (await bcrypt.compare(newPassword, account.password_hash)) {
+    message("/account", "Choose a password different from your current password.", "error");
+  }
+
+  const passwordHash = await bcrypt.hash(newPassword, 12);
+  const updated = await users.updateOne(
+    { id: user.id, password_hash: account.password_hash },
+    { $set: { password_hash: passwordHash } },
+  );
+  if (updated.modifiedCount !== 1) message("/account", "Your password changed in another request. Sign in again and retry.", "error");
+  await audit(user.id, "user.password.changed", "");
+  message("/account", "Your password has been changed.");
 }
 
 export async function chooseSubjects(data: FormData): Promise<void> {
   const user = await requireUser(["student"]);
   const ids = [...new Set(data.getAll("subjectIds").map(Number).filter((id) => Number.isSafeInteger(id) && id > 0))];
-  const db = getDb();
-  await db.transaction(async (tx) => {
-    await tx.prepare("DELETE FROM student_subjects WHERE student_id = ?").run(user.id);
-    const insert = tx.prepare("INSERT INTO student_subjects (student_id, subject_id) VALUES (?, ?)");
-    for (const id of ids) {
-      if (!await tx.prepare("SELECT 1 FROM subjects WHERE id = ? AND active = 1").get(id)) {
-        throw new Error("A selected subject is unavailable.");
-      }
-      await insert.run(user.id, id);
+  await withTransaction(async (session) => {
+    const subjects = getDb().collection<SubjectDocument>("subjects");
+    const availableCount = await subjects.countDocuments({ id: { $in: ids }, active: 1 }, { session });
+    if (availableCount !== ids.length) throw new Error("A selected subject is unavailable.");
+    const preferences = getDb().collection("student_subjects");
+    await preferences.deleteMany({ student_id: user.id }, { session });
+    if (ids.length) {
+      await preferences.insertMany(ids.map((subjectId) => ({ student_id: user.id, subject_id: subjectId })), { session });
     }
   });
   message("/dashboard", "Your subject preferences are saved.");
@@ -255,14 +251,12 @@ export async function joinFreeBatch(data: FormData): Promise<void> {
   const user = await requireUser(["student"]);
   const batchId = positiveInt(text(data, "batchId"));
   if (!batchId) message("/batches", "Invalid batch.", "error");
-  const db = getDb();
-  const batch = await db.prepare("SELECT is_free, published FROM batches WHERE id = ?").get(batchId) as { is_free: number; published: number } | undefined;
+  await initializeDatabase();
+  const batch = await getDb().collection<BatchDocument>("batches")
+    .findOne({ id: batchId }, { projection: { is_free: 1, published: 1 } });
   if (!batch?.published || !batch.is_free) message("/batches", "This batch is not available for free enrollment.", "error");
 
-  await db.prepare(`
-    INSERT INTO enrollments (student_id, batch_id) VALUES (?, ?)
-    ON CONFLICT(student_id, batch_id) DO UPDATE SET status = 'active'
-  `).run(user.id, batchId);
+  await activateEnrollment(user.id, batchId);
   await audit(user.id, "enrollment.free", String(batchId));
   message("/batches", "You have joined the batch.");
 }
@@ -273,27 +267,73 @@ export async function requestOfflinePayment(data: FormData): Promise<void> {
   const reference = text(data, "reference").slice(0, 120);
   if (!batchId) message("/batches", "Invalid batch.", "error");
 
-  const db = getDb();
-  const batch = await db
-    .prepare("SELECT price_paise, is_free, published FROM batches WHERE id = ?")
-    .get(batchId) as { price_paise: number; is_free: number; published: number } | undefined;
+  await initializeDatabase();
+  const database = getDb();
+  const batch = await database.collection<BatchDocument>("batches")
+    .findOne({ id: batchId }, { projection: { price_paise: 1, is_free: 1, published: 1 } });
   if (!batch?.published || batch.is_free) message("/batches", "This batch is not available for offline payment.", "error");
-  if (await db.prepare("SELECT 1 FROM enrollments WHERE student_id = ? AND batch_id = ? AND status = 'active'").get(user.id, batchId)) {
+  if (await database.collection<EnrollmentDocument>("enrollments")
+    .findOne({ student_id: user.id, batch_id: batchId, status: "active" })) {
     message("/batches", "You are already enrolled in this batch.");
   }
 
-  await db.prepare(`
-    INSERT INTO offline_payment_requests (student_id, batch_id, amount_paise, reference)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(student_id, batch_id) DO UPDATE SET
-      amount_paise = excluded.amount_paise,
-      reference = excluded.reference,
-      status = 'pending',
-      decision_note = '',
-      verified_by = NULL,
-      verified_at = NULL
-    WHERE offline_payment_requests.status IN ('pending', 'rejected')
-  `).run(user.id, batchId, batch.price_paise, reference);
+  const payments = database.collection<OfflinePaymentDocument>("offline_payment_requests");
+  const existing = await payments.findOne({ student_id: user.id, batch_id: batchId });
+  const now = new Date();
+  if (existing?.status === "confirmed") message("/batches", "This payment request has already been confirmed.");
+  if (existing) {
+    const updated = await payments.updateOne(
+      { id: existing.id, status: { $in: ["pending", "rejected"] } },
+      {
+        $set: {
+          amount_paise: batch.price_paise,
+          reference,
+          status: "pending",
+          decision_note: "",
+          verified_by: null,
+          verified_at: null,
+          verified_amount_paise: null,
+          payment_method: null,
+        },
+      },
+    );
+    if (updated.matchedCount !== 1) message("/batches", "This payment request has already been processed.", "error");
+  } else {
+    try {
+      await payments.insertOne({
+        id: await nextId("offline_payment_requests"),
+        student_id: user.id,
+        batch_id: batchId,
+        amount_paise: batch.price_paise,
+        verified_amount_paise: null,
+        payment_method: null,
+        reference,
+        status: "pending",
+        decision_note: "",
+        verified_by: null,
+        verified_at: null,
+        created_at: now,
+      });
+    } catch (error) {
+      if (!isUniqueViolation(error)) throw error;
+      const updated = await payments.updateOne(
+        { student_id: user.id, batch_id: batchId, status: { $in: ["pending", "rejected"] } },
+        {
+          $set: {
+            amount_paise: batch.price_paise,
+            reference,
+            status: "pending",
+            decision_note: "",
+            verified_by: null,
+            verified_at: null,
+            verified_amount_paise: null,
+            payment_method: null,
+          },
+        },
+      );
+      if (updated.matchedCount !== 1) message("/batches", "This payment request has already been processed.", "error");
+    }
+  }
   await audit(user.id, "payment.offline.requested", String(batchId));
   message("/batches", "Offline payment request submitted. Access stays locked until an administrator confirms receipt.");
 }
@@ -305,51 +345,51 @@ export async function decideOfflinePayment(data: FormData): Promise<void> {
   const note = text(data, "decisionNote").slice(0, 500);
   const paymentMethod = text(data, "paymentMethod").slice(0, 80);
   const verifiedRupees = Number(text(data, "verifiedAmount"));
-  if (!requestId || !["confirmed", "rejected"].includes(decision)) {
+  if (!requestId || (decision !== "confirmed" && decision !== "rejected")) {
     message("/admin/payments", "Invalid payment decision.", "error");
   }
   if (decision === "confirmed" && (!Number.isFinite(verifiedRupees) || verifiedRupees <= 0 || !paymentMethod)) {
     message("/admin/payments", "Enter the verified amount and collection method before confirming.", "error");
   }
 
-  const db = getDb();
-  const request = await db
-    .prepare("SELECT id, student_id, batch_id, status FROM offline_payment_requests WHERE id = ?")
-    .get(requestId) as { id: number; student_id: number; batch_id: number; status: string } | undefined;
+  const database = getDb();
+  const payments = database.collection<OfflinePaymentDocument>("offline_payment_requests");
+  const request = await payments.findOne({ id: requestId });
   if (!request || request.status !== "pending") message("/admin/payments", "This request is no longer pending.", "error");
 
-  await db.transaction(async (tx) => {
-    const updated = await tx.prepare(`
-      UPDATE offline_payment_requests SET status = ?, decision_note = ?, verified_by = ?, verified_at = ?,
-        verified_amount_paise = ?, payment_method = ?
-      WHERE id = ? AND status = 'pending'
-    `).run(
-      decision,
-      note,
-      admin.id,
-      new Date().toISOString(),
-      decision === "confirmed" ? Math.round(verifiedRupees * 100) : null,
-      decision === "confirmed" ? paymentMethod : null,
-      requestId,
+  await withTransaction(async (session) => {
+    const updated = await payments.updateOne(
+      { id: requestId, status: "pending" },
+      {
+        $set: {
+          status: decision,
+          decision_note: note,
+          verified_by: admin.id,
+          verified_at: new Date(),
+          verified_amount_paise: decision === "confirmed" ? Math.round(verifiedRupees * 100) : null,
+          payment_method: decision === "confirmed" ? paymentMethod : null,
+        },
+      },
+      { session },
     );
-    if (updated.changes !== 1) throw new Error("This payment request has already been processed.");
-    if (decision === "confirmed") {
-      await tx.prepare(`
-        INSERT INTO enrollments (student_id, batch_id) VALUES (?, ?)
-        ON CONFLICT(student_id, batch_id) DO UPDATE SET status = 'active'
-      `).run(request.student_id, request.batch_id);
-      await tx.prepare("INSERT INTO notifications (user_id, message) VALUES (?, ?)").run(
-        request.student_id,
-        "Your offline payment has been verified and your batch is now available.",
-      );
-    } else {
-      await tx.prepare("INSERT INTO notifications (user_id, message) VALUES (?, ?)").run(
-        request.student_id,
-        "Your offline payment request was not confirmed. Contact the administrator for details.",
-      );
-    }
-    await tx.prepare("INSERT INTO audit_logs (actor_id, action, details) VALUES (?, ?, ?)")
-      .run(admin.id, `payment.offline.${decision}`, String(requestId));
+    if (updated.modifiedCount !== 1) throw new Error("This payment request has already been processed.");
+    if (decision === "confirmed") await activateEnrollment(request.student_id, request.batch_id, session);
+    await database.collection<NotificationDocument>("notifications").insertOne({
+      id: await nextId("notifications", session),
+      user_id: request.student_id,
+      message: decision === "confirmed"
+        ? "Your offline payment has been verified and your batch is now available."
+        : "Your offline payment request was not confirmed. Contact the administrator for details.",
+      read_at: null,
+      created_at: new Date(),
+    }, { session });
+    await database.collection<AuditLogDocument>("audit_logs").insertOne({
+      id: await nextId("audit_logs", session),
+      actor_id: admin.id,
+      action: `payment.offline.${decision}`,
+      details: String(requestId),
+      created_at: new Date(),
+    }, { session });
   });
   message("/admin/payments", `Payment request ${decision}.`);
 }
@@ -365,26 +405,40 @@ export async function createTeacher(data: FormData): Promise<void> {
     message("/admin/teachers", "Provide valid account details, a 12-character temporary password, and at least one subject.", "error");
   }
 
-  const db = getDb();
+  const database = getDb();
   try {
     const passwordHash = await bcrypt.hash(password, 12);
-    await db.transaction(async (tx) => {
-      const result = await tx.prepare("INSERT INTO users (name, email, mobile, password_hash, email_verified, role) VALUES (?, ?, ?, ?, 1, 'teacher') RETURNING id")
-        .get(name, email, mobile, passwordHash) as { id: number };
-      const insert = tx.prepare("INSERT INTO teacher_subjects (teacher_id, subject_id) VALUES (?, ?)");
-      for (const id of subjectIds) {
-        if (!await tx.prepare("SELECT 1 FROM subjects WHERE id = ? AND active = 1").get(id)) {
-          throw new Error("A selected subject is unavailable.");
-        }
-        await insert.run(result.id, id);
+    await withTransaction(async (session) => {
+      const subjects = database.collection<SubjectDocument>("subjects");
+      if (await subjects.countDocuments({ id: { $in: subjectIds }, active: 1 }, { session }) !== subjectIds.length) {
+        throw new Error("A selected subject is unavailable.");
       }
-      await tx.prepare("INSERT INTO audit_logs (actor_id, action, details) VALUES (?, 'teacher.created', ?)")
-        .run(admin.id, email);
+      const id = await nextId("users", session);
+      await database.collection<UserDocument>("users").insertOne({
+        id,
+        name,
+        email,
+        email_key: email,
+        mobile,
+        password_hash: passwordHash,
+        role: "teacher",
+        active: 1,
+        created_at: new Date(),
+      }, { session });
+      await database.collection("teacher_subjects").insertMany(
+        subjectIds.map((subject_id) => ({ teacher_id: id, subject_id })),
+        { session },
+      );
+      await database.collection<AuditLogDocument>("audit_logs").insertOne({
+        id: await nextId("audit_logs", session),
+        actor_id: admin.id,
+        action: "teacher.created",
+        details: email,
+        created_at: new Date(),
+      }, { session });
     });
   } catch (error) {
-    if (isUniqueViolation(error)) {
-      message("/admin/teachers", "An account with that email already exists.", "error");
-    }
+    if (isUniqueViolation(error)) message("/admin/teachers", "An account with that email already exists.", "error");
     throw error;
   }
   message("/admin/teachers", "Teacher account created. Share the temporary password securely.");
@@ -394,9 +448,10 @@ export async function toggleTeacher(data: FormData): Promise<void> {
   const admin = await requireUser(["admin"]);
   const teacherId = positiveInt(text(data, "teacherId"));
   if (!teacherId) message("/admin/teachers", "Invalid teacher.", "error");
-  const teacher = await getDb().prepare("SELECT id, active FROM users WHERE id = ? AND role = 'teacher'").get(teacherId) as { id: number; active: number } | undefined;
+  const users = getDb().collection<UserDocument>("users");
+  const teacher = await users.findOne({ id: teacherId, role: "teacher" });
   if (!teacher) message("/admin/teachers", "Teacher not found.", "error");
-  await getDb().prepare("UPDATE users SET active = ? WHERE id = ?").run(teacher.active ? 0 : 1, teacherId);
+  await users.updateOne({ id: teacherId }, { $set: { active: teacher.active ? 0 : 1 } });
   await audit(admin.id, teacher.active ? "teacher.suspended" : "teacher.activated", String(teacherId));
   message("/admin/teachers", teacher.active ? "Teacher suspended." : "Teacher activated.");
 }
@@ -407,11 +462,16 @@ export async function createSubject(data: FormData): Promise<void> {
   const description = text(data, "description").slice(0, 500);
   if (name.length < 2) message("/admin/subjects", "Subject name must be at least 2 characters.", "error");
   try {
-    await getDb().prepare("INSERT INTO subjects (name, description) VALUES (?, ?)").run(name, description);
+    await initializeDatabase();
+    await getDb().collection<SubjectDocument>("subjects").insertOne({
+      id: await nextId("subjects"),
+      name,
+      name_key: name.toLocaleLowerCase("en"),
+      description,
+      active: 1,
+    });
   } catch (error) {
-    if (isUniqueViolation(error)) {
-      message("/admin/subjects", "That subject already exists.", "error");
-    }
+    if (isUniqueViolation(error)) message("/admin/subjects", "That subject already exists.", "error");
     throw error;
   }
   await audit(admin.id, "subject.created", name);
@@ -428,19 +488,29 @@ export async function createBatch(data: FormData): Promise<void> {
     message("/admin/batches", "Enter a batch title, a non-negative price, and at least one subject.", "error");
   }
 
-  const db = getDb();
-  await db.transaction(async (tx) => {
-    const result = await tx.prepare("INSERT INTO batches (title, description, price_paise, is_free) VALUES (?, ?, ?, ?) RETURNING id")
-      .get(title, description, Math.round(price * 100), price === 0 ? 1 : 0) as { id: number };
-    const insert = tx.prepare("INSERT INTO batch_subjects (batch_id, subject_id) VALUES (?, ?)");
-    for (const id of subjectIds) {
-      if (!await tx.prepare("SELECT 1 FROM subjects WHERE id = ? AND active = 1").get(id)) {
-        throw new Error("A selected subject is unavailable.");
-      }
-      await insert.run(result.id, id);
+  const database = getDb();
+  const id = await withTransaction(async (session) => {
+    if (await database.collection<SubjectDocument>("subjects")
+      .countDocuments({ id: { $in: subjectIds }, active: 1 }, { session }) !== subjectIds.length) {
+      throw new Error("A selected subject is unavailable.");
     }
+    const batchId = await nextId("batches", session);
+    await database.collection<BatchDocument>("batches").insertOne({
+      id: batchId,
+      title,
+      description,
+      price_paise: Math.round(price * 100),
+      is_free: price === 0 ? 1 : 0,
+      published: 1,
+      created_at: new Date(),
+    }, { session });
+    await database.collection("batch_subjects").insertMany(
+      subjectIds.map((subject_id) => ({ batch_id: batchId, subject_id })),
+      { session },
+    );
+    return batchId;
   });
-  await audit(admin.id, "batch.created", title);
+  await audit(admin.id, "batch.created", `${title} (ID ${id})`);
   message("/admin/batches", "Batch created.");
 }
 
@@ -448,9 +518,10 @@ export async function toggleBatch(data: FormData): Promise<void> {
   const admin = await requireUser(["admin"]);
   const batchId = positiveInt(text(data, "batchId"));
   if (!batchId) message("/admin/batches", "Invalid batch.", "error");
-  const batch = await getDb().prepare("SELECT published FROM batches WHERE id = ?").get(batchId) as { published: number } | undefined;
+  const batches = getDb().collection<BatchDocument>("batches");
+  const batch = await batches.findOne({ id: batchId });
   if (!batch) message("/admin/batches", "Batch not found.", "error");
-  await getDb().prepare("UPDATE batches SET published = ? WHERE id = ?").run(batch.published ? 0 : 1, batchId);
+  await batches.updateOne({ id: batchId }, { $set: { published: batch.published ? 0 : 1 } });
   await audit(admin.id, batch.published ? "batch.archived" : "batch.published", String(batchId));
   message("/admin/batches", batch.published ? "Batch unpublished." : "Batch published.");
 }
@@ -474,10 +545,25 @@ export async function createClass(data: FormData): Promise<void> {
   ) {
     message("/teacher/content", "Enter valid class details and use an assigned subject and HTTPS video URL.", "error");
   }
-  await getDb().prepare(`
-    INSERT INTO classes (title, description, subject_id, teacher_id, batch_id, video_url, duration_seconds, published)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(title, description, subjectId, user.id, batchId, videoUrl, duration, published);
+  await initializeDatabase();
+  const database = getDb();
+  const subject = await database.collection<SubjectDocument>("subjects").findOne({ id: subjectId, active: 1 });
+  if (!subject) message("/teacher/content", "The selected subject is unavailable.", "error");
+  if (batchId && !await database.collection<BatchDocument>("batches").findOne({ id: batchId })) {
+    message("/teacher/content", "The selected batch is unavailable.", "error");
+  }
+  await database.collection<ClassDocument>("classes").insertOne({
+    id: await nextId("classes"),
+    title,
+    description,
+    subject_id: subjectId,
+    teacher_id: user.id,
+    batch_id: batchId,
+    video_url: videoUrl,
+    duration_seconds: duration,
+    published,
+    created_at: new Date(),
+  });
   await audit(user.id, "class.created", title);
   message("/teacher/content", "Class created.");
 }
@@ -491,13 +577,26 @@ export async function createReelSeries(data: FormData): Promise<void> {
   if (title.length < 3 || !subjectId || !await teacherOwnsSubject(user.id, user.role, subjectId)) {
     message("/teacher/content", "Enter a series title and a subject assigned to your account.", "error");
   }
-  const result = await getDb().prepare(`
-    INSERT INTO reel_series (title, topic, subject_id, teacher_id, batch_id, published)
-    VALUES (?, ?, ?, ?, ?, ?)
-    RETURNING id
-  `).get(title, topic, subjectId, user.id, batchId, user.role === "admin" ? 1 : 0) as { id: number };
+  await initializeDatabase();
+  const database = getDb();
+  const subject = await database.collection<SubjectDocument>("subjects").findOne({ id: subjectId, active: 1 });
+  if (!subject) message("/teacher/content", "The selected subject is unavailable.", "error");
+  if (batchId && !await database.collection<BatchDocument>("batches").findOne({ id: batchId })) {
+    message("/teacher/content", "The selected batch is unavailable.", "error");
+  }
+  const seriesId = await nextId("reel_series");
+  await database.collection<ReelSeriesDocument>("reel_series").insertOne({
+    id: seriesId,
+    title,
+    topic,
+    subject_id: subjectId,
+    teacher_id: user.id,
+    batch_id: batchId,
+    published: user.role === "admin" ? 1 : 0,
+    created_at: new Date(),
+  });
   await audit(user.id, "reel_series.created", title);
-  message("/teacher/content", `Series created (ID ${result.id}). Add reels below.`);
+  message("/teacher/content", `Series created (ID ${seriesId}). Add reels below.`);
 }
 
 export async function createReel(data: FormData): Promise<void> {
@@ -511,19 +610,26 @@ export async function createReel(data: FormData): Promise<void> {
   if (!seriesId || title.length < 3 || !videoUrl.startsWith("https://") || !Number.isSafeInteger(duration) || duration <= 0 || !Number.isSafeInteger(sequence) || sequence <= 0) {
     message("/teacher/content", "Enter a series, title, HTTPS video URL, positive duration, and sequence number.", "error");
   }
-  const series = await getDb().prepare("SELECT teacher_id, subject_id FROM reel_series WHERE id = ?").get(seriesId) as { teacher_id: number; subject_id: number } | undefined;
+  await initializeDatabase();
+  const series = await getDb().collection<ReelSeriesDocument>("reel_series")
+    .findOne({ id: seriesId }, { projection: { teacher_id: 1, subject_id: 1 } });
   if (!series || (user.role === "teacher" && (series.teacher_id !== user.id || !await teacherOwnsSubject(user.id, user.role, series.subject_id)))) {
     message("/teacher/content", "You do not have permission to edit this series.", "error");
   }
   try {
-    await getDb().prepare(`
-      INSERT INTO reels (series_id, title, description, video_url, duration_seconds, sequence_number, published)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(seriesId, title, description, videoUrl, duration, sequence, user.role === "admin" ? 1 : 0);
+    await getDb().collection<ReelDocument>("reels").insertOne({
+      id: await nextId("reels"),
+      series_id: seriesId,
+      title,
+      description,
+      video_url: videoUrl,
+      duration_seconds: duration,
+      sequence_number: sequence,
+      published: user.role === "admin" ? 1 : 0,
+      created_at: new Date(),
+    });
   } catch (error) {
-    if (isUniqueViolation(error)) {
-      message("/teacher/content", "That sequence number is already used in this series.", "error");
-    }
+    if (isUniqueViolation(error)) message("/teacher/content", "That sequence number is already used in this series.", "error");
     throw error;
   }
   await audit(user.id, "reel.created", title);
@@ -537,21 +643,30 @@ export async function togglePublication(data: FormData): Promise<void> {
   if (!id || !["class", "series", "reel"].includes(entity)) {
     message(user.role === "admin" ? "/admin/content" : "/teacher/content", "Invalid content.", "error");
   }
-  const db = getDb();
-  let current: { published: number; teacher_id?: number } | undefined;
-  if (entity === "class") current = await db.prepare("SELECT published, teacher_id FROM classes WHERE id = ?").get(id) as typeof current;
-  if (entity === "series") current = await db.prepare("SELECT published, teacher_id FROM reel_series WHERE id = ?").get(id) as typeof current;
-  if (entity === "reel") {
-    current = await db.prepare(`
-      SELECT reels.published, reel_series.teacher_id FROM reels
-      JOIN reel_series ON reel_series.id = reels.series_id WHERE reels.id = ?
-    `).get(id) as typeof current;
+  await initializeDatabase();
+  const database = getDb();
+  let current: { published: number; teacher_id: number } | null = null;
+  let update;
+  if (entity === "class") {
+    const classes = database.collection<ClassDocument>("classes");
+    current = await classes.findOne({ id }, { projection: { published: 1, teacher_id: 1 } });
+    update = (published: number) => classes.updateOne({ id }, { $set: { published } });
+  } else if (entity === "series") {
+    const series = database.collection<ReelSeriesDocument>("reel_series");
+    current = await series.findOne({ id }, { projection: { published: 1, teacher_id: 1 } });
+    update = (published: number) => series.updateOne({ id }, { $set: { published } });
+  } else {
+    const reel = await database.collection<ReelDocument>("reels").findOne({ id });
+    const series = reel
+      ? await database.collection<ReelSeriesDocument>("reel_series").findOne({ id: reel.series_id })
+      : null;
+    if (reel && series) current = { published: reel.published, teacher_id: series.teacher_id };
+    update = (published: number) => database.collection<ReelDocument>("reels").updateOne({ id }, { $set: { published } });
   }
   if (!current || (user.role === "teacher" && current.teacher_id !== user.id)) {
     message(user.role === "admin" ? "/admin/content" : "/teacher/content", "Content not found or access denied.", "error");
   }
-  const table = entity === "class" ? "classes" : entity === "series" ? "reel_series" : "reels";
-  await db.prepare(`UPDATE ${table} SET published = ? WHERE id = ?`).run(current.published ? 0 : 1, id);
+  await update(current.published ? 0 : 1);
   await audit(user.id, `${entity}.${current.published ? "unpublished" : "published"}`, String(id));
   message(user.role === "admin" ? "/admin/content" : "/teacher/content", current.published ? "Content unpublished." : "Content published.");
 }
@@ -561,19 +676,27 @@ export async function saveClassProgress(classId: number, positionSeconds: number
   if (!Number.isSafeInteger(classId) || classId <= 0 || !Number.isFinite(positionSeconds) || positionSeconds < 0) {
     throw new Error("Invalid class progress update.");
   }
-  const db = getDb();
-  const item = await db.prepare("SELECT batch_id, duration_seconds, published FROM classes WHERE id = ?")
-    .get(classId) as { batch_id: number | null; duration_seconds: number; published: number } | undefined;
+  await initializeDatabase();
+  const database = getDb();
+  const item = await database.collection<ClassDocument>("classes").findOne({ id: classId });
   if (!item?.published || !await hasBatchAccess(student.id, item.batch_id)) {
     throw new Error("This class is not available to your account.");
   }
   const position = Math.min(Math.floor(positionSeconds), item.duration_seconds || Math.floor(positionSeconds));
-  await db.prepare(`
-    INSERT INTO class_progress (student_id, class_id, position_seconds) VALUES (?, ?, ?)
-    ON CONFLICT(student_id, class_id) DO UPDATE SET
-      position_seconds = excluded.position_seconds,
-      updated_at = datetime('now')
-  `).run(student.id, classId, position);
+  await database.collection<ClassProgressDocument>("class_progress").updateOne(
+    { student_id: student.id, class_id: classId },
+    { $set: { position_seconds: position, updated_at: new Date() } },
+    { upsert: true },
+  );
+}
+
+async function getAccessibleReel(reelId: number, studentId: number) {
+  const database = getDb();
+  const reel = await database.collection<ReelDocument>("reels").findOne({ id: reelId });
+  if (!reel) return null;
+  const series = await database.collection<ReelSeriesDocument>("reel_series").findOne({ id: reel.series_id });
+  if (!series || !reel.published || !series.published || !await hasBatchAccess(studentId, series.batch_id)) return null;
+  return { reel, series };
 }
 
 export async function beginReel(reelId: number, positionSeconds: number): Promise<void> {
@@ -581,23 +704,29 @@ export async function beginReel(reelId: number, positionSeconds: number): Promis
   if (!Number.isSafeInteger(reelId) || reelId <= 0 || !Number.isFinite(positionSeconds) || positionSeconds < 0) {
     throw new Error("Invalid reel progress update.");
   }
-  const db = getDb();
-  const reel = await db.prepare(`
-    SELECT reels.duration_seconds, reel_series.batch_id, reels.published, reel_series.published AS series_published
-    FROM reels JOIN reel_series ON reel_series.id = reels.series_id WHERE reels.id = ?
-  `).get(reelId) as { duration_seconds: number; batch_id: number | null; published: number; series_published: number } | undefined;
-  if (!reel?.published || !reel.series_published || !await hasBatchAccess(student.id, reel.batch_id)) {
-    throw new Error("This reel is not available to your account.");
-  }
-
-  const progress = await db.prepare("SELECT position_seconds, completed FROM reel_progress WHERE student_id = ? AND reel_id = ?")
-    .get(student.id, reelId) as { position_seconds: number; completed: number } | undefined;
-  const position = Math.min(Math.max(0, Math.floor(positionSeconds || 0)), reel.duration_seconds);
-  await db.prepare(`
-    INSERT INTO reel_progress (student_id, reel_id, position_seconds, checkpoint_at)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(student_id, reel_id) DO UPDATE SET checkpoint_at = excluded.checkpoint_at
-  `).run(student.id, reelId, progress?.position_seconds ?? position, new Date().toISOString());
+  await initializeDatabase();
+  const result = await getAccessibleReel(reelId, student.id);
+  if (!result) throw new Error("This reel is not available to your account.");
+  const database = getDb();
+  const now = new Date();
+  const progress = await database.collection<ReelProgressDocument>("reel_progress")
+    .findOne({ student_id: student.id, reel_id: reelId });
+  const position = Math.min(Math.max(0, Math.floor(positionSeconds || 0)), result.reel.duration_seconds);
+  await database.collection<ReelProgressDocument>("reel_progress").updateOne(
+    { student_id: student.id, reel_id: reelId },
+    progress
+      ? { $set: { checkpoint_at: now } }
+      : {
+          $setOnInsert: {
+            position_seconds: position,
+            watched_seconds: 0,
+            completed: 0,
+            checkpoint_at: now,
+            updated_at: now,
+          },
+        },
+    { upsert: true },
+  );
 }
 
 export async function saveReelProgress(reelId: number, positionSeconds: number): Promise<void> {
@@ -605,50 +734,25 @@ export async function saveReelProgress(reelId: number, positionSeconds: number):
   if (!Number.isSafeInteger(reelId) || reelId <= 0 || !Number.isFinite(positionSeconds) || positionSeconds < 0) {
     throw new Error("Invalid reel progress update.");
   }
-  const db = getDb();
-  const reel = await db.prepare(`
-    SELECT reels.duration_seconds, reel_series.batch_id, reels.published, reel_series.published AS series_published
-    FROM reels JOIN reel_series ON reel_series.id = reels.series_id WHERE reels.id = ?
-  `).get(reelId) as { duration_seconds: number; batch_id: number | null; published: number; series_published: number } | undefined;
-  if (!reel?.published || !reel.series_published || !await hasBatchAccess(student.id, reel.batch_id)) {
-    throw new Error("This reel is not available to your account.");
-  }
-
-  const existing = await db.prepare(`
-    SELECT position_seconds, watched_seconds, checkpoint_at, completed
-    FROM reel_progress WHERE student_id = ? AND reel_id = ?
-  `).get(student.id, reelId) as {
-    position_seconds: number;
-    watched_seconds: number;
-    checkpoint_at: string;
-    completed: number;
-  } | undefined;
-  const progress = calculateReelProgress(existing, positionSeconds, reel.duration_seconds, new Date());
-  if (!existing) {
-    await db.prepare(`
-      INSERT INTO reel_progress (student_id, reel_id, position_seconds, watched_seconds, completed, checkpoint_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(
-      student.id,
-      reelId,
-      progress.position_seconds,
-      progress.watched_seconds,
-      progress.completed,
-      progress.checkpoint_at,
-    );
-    return;
-  }
-  await db.prepare(`
-    UPDATE reel_progress SET position_seconds = ?, watched_seconds = ?, completed = ?,
-      checkpoint_at = ?, updated_at = datetime('now')
-    WHERE student_id = ? AND reel_id = ?
-  `).run(
-    progress.position_seconds,
-    progress.watched_seconds,
-    progress.completed,
-    progress.checkpoint_at,
-    student.id,
-    reelId,
+  await initializeDatabase();
+  const result = await getAccessibleReel(reelId, student.id);
+  if (!result) throw new Error("This reel is not available to your account.");
+  const progressCollection = getDb().collection<ReelProgressDocument>("reel_progress");
+  const existing = await progressCollection.findOne({ student_id: student.id, reel_id: reelId });
+  const progress = calculateReelProgress(existing ?? undefined, positionSeconds, result.reel.duration_seconds, new Date());
+  await progressCollection.updateOne(
+    { student_id: student.id, reel_id: reelId },
+    {
+      $set: {
+        position_seconds: progress.position_seconds,
+        watched_seconds: progress.watched_seconds,
+        completed: progress.completed,
+        checkpoint_at: progress.checkpoint_at,
+        updated_at: new Date(),
+      },
+      $setOnInsert: { student_id: student.id, reel_id: reelId },
+    },
+    { upsert: true },
   );
 }
 
@@ -656,15 +760,55 @@ export async function resetStudentProgress(data: FormData): Promise<void> {
   const admin = await requireUser(["admin"]);
   const studentId = positiveInt(text(data, "studentId"));
   if (!studentId) message("/admin/students", "Invalid student.", "error");
-  const db = getDb();
-  await db.prepare("DELETE FROM reel_progress WHERE student_id = ?").run(studentId);
-  await db.prepare("DELETE FROM class_progress WHERE student_id = ?").run(studentId);
+  await initializeDatabase();
+  const database = getDb();
+  await Promise.all([
+    database.collection<ReelProgressDocument>("reel_progress").deleteMany({ student_id: studentId }),
+    database.collection<ClassProgressDocument>("class_progress").deleteMany({ student_id: studentId }),
+  ]);
   await audit(admin.id, "student.progress.reset", String(studentId));
   message("/admin/students", "Student learning progress reset.");
+}
+
+export async function resetStudentPassword(data: FormData): Promise<void> {
+  const admin = await requireUser(["admin"]);
+  const studentId = positiveInt(text(data, "studentId"));
+  const password = text(data, "newPassword");
+  const confirmation = text(data, "confirmPassword");
+  if (!studentId) message("/admin/students", "Invalid student.", "error");
+  if (password.length < 10 || password !== confirmation) {
+    message("/admin/students", "Use a password of at least 10 characters and confirm it.", "error");
+  }
+
+  const passwordHash = await bcrypt.hash(password, 12);
+  const database = getDb();
+  const updated = await withTransaction(async (session) => {
+    const result = await database.collection<UserDocument>("users").updateOne(
+      { id: studentId, role: "student" },
+      { $set: { password_hash: passwordHash } },
+      { session },
+    );
+    if (result.matchedCount !== 1) return false;
+    await database.collection<SessionDocument>("sessions").deleteMany({ user_id: studentId }, { session });
+    await database.collection<AuditLogDocument>("audit_logs").insertOne({
+      id: await nextId("audit_logs", session),
+      actor_id: admin.id,
+      action: "student.password.reset",
+      details: String(studentId),
+      created_at: new Date(),
+    }, { session });
+    return true;
+  });
+  if (!updated) message("/admin/students", "Student account not found.", "error");
+  message("/admin/students", "Student password changed and active sessions revoked.");
 }
 
 export async function markNotificationsRead(): Promise<void> {
   const user = await getCurrentUser();
   if (!user) return;
-  await getDb().prepare("UPDATE notifications SET read_at = datetime('now') WHERE user_id = ? AND read_at IS NULL").run(user.id);
+  await initializeDatabase();
+  await getDb().collection<NotificationDocument>("notifications").updateMany(
+    { user_id: user.id, read_at: null },
+    { $set: { read_at: new Date() } },
+  );
 }

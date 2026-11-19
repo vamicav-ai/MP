@@ -3,21 +3,43 @@ import { EmptyState, Field, PageHeading, PageMessages, SubjectChoices } from "@/
 import { requireUser } from "@/lib/auth";
 import { getDb } from "@/lib/db";
 import { getSubjects, money } from "@/lib/queries";
+import type { BatchDocument, EnrollmentDocument, SubjectDocument } from "@/lib/models";
 
 type BatchAdmin = { id: number; title: string; description: string; price_paise: number; is_free: number; published: number; subjects: string; enrollments: number };
 
 export default async function AdminBatchesPage() {
   await requireUser(["admin"]);
   const db = getDb();
-  const batches = await db.prepare(`
-    SELECT batches.id, batches.title, batches.description, batches.price_paise, batches.is_free, batches.published,
-      COALESCE(group_concat(DISTINCT subjects.name), '') AS subjects,
-      COUNT(DISTINCT CASE WHEN enrollments.status = 'active' THEN enrollments.student_id END) AS enrollments
-    FROM batches LEFT JOIN batch_subjects ON batch_subjects.batch_id = batches.id
-    LEFT JOIN subjects ON subjects.id = batch_subjects.subject_id
-    LEFT JOIN enrollments ON enrollments.batch_id = batches.id
-    GROUP BY batches.id ORDER BY batches.created_at DESC
-  `).all() as BatchAdmin[];
+  const [batchDocs, links, subjectDocs, enrollments] = await Promise.all([
+    db.collection<BatchDocument>("batches").find().sort({ created_at: -1 }).toArray(),
+    db.collection<{ batch_id: number; subject_id: number }>("batch_subjects").find().toArray(),
+    db.collection<SubjectDocument>("subjects").find().toArray(),
+    db.collection<EnrollmentDocument>("enrollments").find({ status: "active" }).toArray(),
+  ]);
+  const subjectNames = new Map(subjectDocs.map((subject) => [subject.id, subject.name]));
+  const subjectIdsByBatch = new Map<number, number[]>();
+  for (const link of links) {
+    subjectIdsByBatch.set(link.batch_id, [...(subjectIdsByBatch.get(link.batch_id) ?? []), link.subject_id]);
+  }
+  const enrolledStudentsByBatch = new Map<number, Set<number>>();
+  for (const enrollment of enrollments) {
+    const students = enrolledStudentsByBatch.get(enrollment.batch_id) ?? new Set<number>();
+    students.add(enrollment.student_id);
+    enrolledStudentsByBatch.set(enrollment.batch_id, students);
+  }
+  const batches: BatchAdmin[] = batchDocs.map((batch) => ({
+    id: batch.id,
+    title: batch.title,
+    description: batch.description,
+    price_paise: batch.price_paise,
+    is_free: batch.is_free,
+    published: batch.published,
+    subjects: (subjectIdsByBatch.get(batch.id) ?? [])
+      .map((id) => subjectNames.get(id))
+      .filter((name): name is string => Boolean(name))
+      .join(", "),
+    enrollments: enrolledStudentsByBatch.get(batch.id)?.size ?? 0,
+  }));
   const subjects = await getSubjects();
   return (
     <>

@@ -6,6 +6,7 @@ import { requireUser } from "@/lib/auth";
 import { getDb } from "@/lib/db";
 import { canStudentAccessBatch } from "@/lib/queries";
 import { getNextIncompleteReel } from "@/lib/reel-progress";
+import type { ReelDocument, ReelProgressDocument, ReelSeriesDocument, SubjectDocument, UserDocument } from "@/lib/models";
 
 type SeriesDetails = { id: number; title: string; topic: string; subject: string; teacher: string; batch_id: number | null };
 type ReelRow = { id: number; title: string; description: string; duration_seconds: number; sequence_number: number; completed: number; position_seconds: number };
@@ -15,20 +16,34 @@ export default async function ReelSeriesPage({ params }: { params: Promise<{ ser
   const seriesId = Number((await params).seriesId);
   if (!Number.isSafeInteger(seriesId) || seriesId <= 0) notFound();
   const db = getDb();
-  const series = await db.prepare(`
-    SELECT reel_series.id, reel_series.title, reel_series.topic, reel_series.batch_id,
-      subjects.name AS subject, users.name AS teacher
-    FROM reel_series JOIN subjects ON subjects.id = reel_series.subject_id
-    JOIN users ON users.id = reel_series.teacher_id
-    WHERE reel_series.id = ? AND reel_series.published = 1
-  `).get(seriesId) as SeriesDetails | undefined;
+  const seriesDoc = await db.collection<ReelSeriesDocument>("reel_series").findOne({ id: seriesId, published: 1 });
+  const [subject, teacher] = seriesDoc ? await Promise.all([
+    db.collection<SubjectDocument>("subjects").findOne({ id: seriesDoc.subject_id }),
+    db.collection<UserDocument>("users").findOne({ id: seriesDoc.teacher_id }),
+  ]) : [null, null];
+  const series: SeriesDetails | undefined = seriesDoc && subject && teacher ? {
+    id: seriesDoc.id,
+    title: seriesDoc.title,
+    topic: seriesDoc.topic,
+    batch_id: seriesDoc.batch_id,
+    subject: subject.name,
+    teacher: teacher.name,
+  } : undefined;
   if (!series || !await canStudentAccessBatch(user.id, series.batch_id)) notFound();
-  const reels = await db.prepare(`
-    SELECT reels.id, reels.title, reels.description, reels.duration_seconds, reels.sequence_number,
-      COALESCE(reel_progress.completed, 0) AS completed, COALESCE(reel_progress.position_seconds, 0) AS position_seconds
-    FROM reels LEFT JOIN reel_progress ON reel_progress.reel_id = reels.id AND reel_progress.student_id = ?
-    WHERE reels.series_id = ? AND reels.published = 1 ORDER BY reels.sequence_number
-  `).all(user.id, seriesId) as ReelRow[];
+  const [reelDocs, progressDocs] = await Promise.all([
+    db.collection<ReelDocument>("reels").find({ series_id: seriesId, published: 1 }).sort({ sequence_number: 1 }).toArray(),
+    db.collection<ReelProgressDocument>("reel_progress").find({ student_id: user.id }).toArray(),
+  ]);
+  const progressByReel = new Map(progressDocs.map((progress) => [progress.reel_id, progress]));
+  const reels: ReelRow[] = reelDocs.map((reel) => ({
+    id: reel.id,
+    title: reel.title,
+    description: reel.description,
+    duration_seconds: reel.duration_seconds,
+    sequence_number: reel.sequence_number,
+    completed: progressByReel.get(reel.id)?.completed ?? 0,
+    position_seconds: progressByReel.get(reel.id)?.position_seconds ?? 0,
+  }));
   const next = getNextIncompleteReel(reels);
 
   return (

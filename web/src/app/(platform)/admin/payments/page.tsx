@@ -3,19 +3,37 @@ import { EmptyState, Field, PageHeading, PageMessages } from "@/components/ui";
 import { requireUser } from "@/lib/auth";
 import { getDb } from "@/lib/db";
 import { money } from "@/lib/queries";
+import type { BatchDocument, OfflinePaymentDocument, UserDocument } from "@/lib/models";
 
-type Request = { id: number; student: string; email: string; batch: string; amount_paise: number; reference: string; status: string; created_at: string; decision_note: string };
+type Request = { id: number; student: string; email: string; batch: string; amount_paise: number; reference: string; status: string; created_at: string | Date; decision_note: string };
 
 export default async function AdminPaymentsPage() {
   await requireUser(["admin"]);
-  const requests = await getDb().prepare(`
-    SELECT requests.id, users.name AS student, users.email, batches.title AS batch,
-      requests.amount_paise, requests.reference, requests.status, requests.created_at, requests.decision_note
-    FROM offline_payment_requests AS requests
-    JOIN users ON users.id = requests.student_id
-    JOIN batches ON batches.id = requests.batch_id
-    ORDER BY CASE requests.status WHEN 'pending' THEN 0 ELSE 1 END, requests.created_at DESC
-  `).all() as Request[];
+  const db = getDb();
+  const [paymentDocs, userDocs, batchDocs] = await Promise.all([
+    db.collection<OfflinePaymentDocument>("offline_payment_requests").find()
+      .sort({ created_at: -1 }).toArray(),
+    db.collection<UserDocument>("users").find().toArray(),
+    db.collection<BatchDocument>("batches").find().toArray(),
+  ]);
+  const users = new Map(userDocs.map((user) => [user.id, user]));
+  const batches = new Map(batchDocs.map((batch) => [batch.id, batch]));
+  const requests: Request[] = paymentDocs.flatMap((item) => {
+    const student = users.get(item.student_id);
+    const batch = batches.get(item.batch_id);
+    return student && batch ? [{
+      id: item.id,
+      student: student.name,
+      email: student.email,
+      batch: batch.title,
+      amount_paise: item.amount_paise,
+      reference: item.reference,
+      status: item.status,
+      created_at: item.created_at,
+      decision_note: item.decision_note,
+    }] : [];
+  }).sort((left, right) => Number(right.status === "pending") - Number(left.status === "pending")
+    || new Date(right.created_at).getTime() - new Date(left.created_at).getTime());
   const pending = requests.filter((request) => request.status === "pending").length;
   return (
     <>

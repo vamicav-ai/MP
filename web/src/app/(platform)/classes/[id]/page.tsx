@@ -6,6 +6,7 @@ import { PageMessages } from "@/components/ui";
 import { requireUser } from "@/lib/auth";
 import { getDb } from "@/lib/db";
 import { canStudentAccessBatch } from "@/lib/queries";
+import type { ClassDocument, ClassProgressDocument, SubjectDocument, UserDocument } from "@/lib/models";
 
 type ClassDetails = {
   id: number;
@@ -23,14 +24,24 @@ export default async function ClassPlayerPage({ params }: { params: Promise<{ id
   const user = await requireUser(["student"]);
   const id = Number((await params).id);
   if (!Number.isSafeInteger(id) || id <= 0) notFound();
-  const lesson = await getDb().prepare(`
-    SELECT classes.id, classes.title, classes.description, classes.video_url, classes.duration_seconds,
-      classes.batch_id, subjects.name AS subject, users.name AS teacher, class_progress.position_seconds
-    FROM classes JOIN subjects ON subjects.id = classes.subject_id
-    JOIN users ON users.id = classes.teacher_id
-    LEFT JOIN class_progress ON class_progress.class_id = classes.id AND class_progress.student_id = ?
-    WHERE classes.id = ? AND classes.published = 1
-  `).get(user.id, id) as ClassDetails | undefined;
+  const db = getDb();
+  const lessonDoc = await db.collection<ClassDocument>("classes").findOne({ id, published: 1 });
+  const [subject, teacher, progress] = lessonDoc ? await Promise.all([
+    db.collection<SubjectDocument>("subjects").findOne({ id: lessonDoc.subject_id }),
+    db.collection<UserDocument>("users").findOne({ id: lessonDoc.teacher_id }),
+    db.collection<ClassProgressDocument>("class_progress").findOne({ student_id: user.id, class_id: id }),
+  ]) : [null, null, null];
+  const lesson: ClassDetails | undefined = lessonDoc && subject && teacher ? {
+    id: lessonDoc.id,
+    title: lessonDoc.title,
+    description: lessonDoc.description,
+    video_url: lessonDoc.video_url,
+    duration_seconds: lessonDoc.duration_seconds,
+    batch_id: lessonDoc.batch_id,
+    subject: subject.name,
+    teacher: teacher.name,
+    position_seconds: progress?.position_seconds ?? null,
+  } : undefined;
   if (!lesson || !await canStudentAccessBatch(user.id, lesson.batch_id)) notFound();
 
   return (

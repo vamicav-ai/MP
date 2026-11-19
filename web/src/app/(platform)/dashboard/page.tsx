@@ -3,9 +3,17 @@ import { ArrowRight, BookOpen, Clapperboard, GraduationCap, UsersRound } from "l
 import { EmptyState, PageHeading, PageMessages, StatCard } from "@/components/ui";
 import { requireUser } from "@/lib/auth";
 import { getDb } from "@/lib/db";
-import { countRows } from "@/lib/queries";
+import { countDocuments } from "@/lib/queries";
+import type {
+  ClassDocument,
+  ClassProgressDocument,
+  EnrollmentDocument,
+  ReelDocument,
+  ReelProgressDocument,
+  ReelSeriesDocument,
+  SubjectDocument,
+} from "@/lib/models";
 
-type DashboardSubject = { id: number; name: string };
 type ContinueClass = { id: number; title: string; subject: string; position_seconds: number };
 type ContinueReel = { id: number; title: string; series_id: number; series: string; position_seconds: number; sequence_number: number };
 
@@ -15,10 +23,10 @@ export default async function DashboardPage() {
 
   if (user.role === "admin") {
     const [students, teachers, batches, pending] = await Promise.all([
-      countRows("SELECT COUNT(*) AS count FROM users WHERE role = 'student'"),
-      countRows("SELECT COUNT(*) AS count FROM users WHERE role = 'teacher' AND active = 1"),
-      countRows("SELECT COUNT(*) AS count FROM batches WHERE published = 1"),
-      countRows("SELECT COUNT(*) AS count FROM offline_payment_requests WHERE status = 'pending'"),
+      countDocuments("users", { role: "student" }),
+      countDocuments("users", { role: "teacher", active: 1 }),
+      countDocuments("batches", { published: 1 }),
+      countDocuments("offline_payment_requests", { status: "pending" }),
     ]);
     return (
       <>
@@ -45,12 +53,13 @@ export default async function DashboardPage() {
   }
 
   if (user.role === "teacher") {
-    const classCount = Number((await db.prepare("SELECT COUNT(*) AS count FROM classes WHERE teacher_id = ?").get(user.id) as { count: number }).count);
-    const seriesCount = Number((await db.prepare("SELECT COUNT(*) AS count FROM reel_series WHERE teacher_id = ?").get(user.id) as { count: number }).count);
-    const published = Number((await db.prepare(`
-      SELECT (SELECT COUNT(*) FROM classes WHERE teacher_id = ? AND published = 1) +
-             (SELECT COUNT(*) FROM reel_series WHERE teacher_id = ? AND published = 1) AS count
-    `).get(user.id, user.id) as { count: number }).count);
+    const [classCount, seriesCount, publishedClasses, publishedSeries] = await Promise.all([
+      countDocuments("classes", { teacher_id: user.id }),
+      countDocuments("reel_series", { teacher_id: user.id }),
+      countDocuments("classes", { teacher_id: user.id, published: 1 }),
+      countDocuments("reel_series", { teacher_id: user.id, published: 1 }),
+    ]);
+    const published = publishedClasses + publishedSeries;
     return (
       <>
         <PageMessages />
@@ -69,35 +78,65 @@ export default async function DashboardPage() {
     );
   }
 
-  const subjects = await db.prepare(`
-    SELECT subjects.id, subjects.name FROM student_subjects
-    JOIN subjects ON subjects.id = student_subjects.subject_id
-    WHERE student_subjects.student_id = ? ORDER BY subjects.name
-  `).all(user.id) as DashboardSubject[];
-  const classes = await db.prepare(`
-    SELECT classes.id, classes.title, subjects.name AS subject, class_progress.position_seconds
-    FROM class_progress JOIN classes ON classes.id = class_progress.class_id
-    JOIN subjects ON subjects.id = classes.subject_id
-    WHERE class_progress.student_id = ? AND classes.published = 1
-      AND (classes.batch_id IS NULL OR EXISTS (
-        SELECT 1 FROM enrollments WHERE student_id = ? AND batch_id = classes.batch_id AND status = 'active'
-      ))
-    ORDER BY class_progress.updated_at DESC LIMIT 3
-  `).all(user.id, user.id) as ContinueClass[];
-  const nextReel = await db.prepare(`
-    SELECT reels.id, reels.title, reels.sequence_number, reel_series.id AS series_id,
-      reel_series.title AS series, COALESCE(reel_progress.position_seconds, 0) AS position_seconds
-    FROM reel_series JOIN reels ON reels.series_id = reel_series.id
-    LEFT JOIN reel_progress ON reel_progress.reel_id = reels.id AND reel_progress.student_id = ?
-    WHERE reel_series.published = 1 AND reels.published = 1
-      AND (reel_series.batch_id IS NULL OR EXISTS (
-        SELECT 1 FROM enrollments WHERE student_id = ? AND batch_id = reel_series.batch_id AND status = 'active'
-      ))
-      AND COALESCE(reel_progress.completed, 0) = 0
-    ORDER BY reel_series.created_at DESC, reels.sequence_number LIMIT 1
-  `).get(user.id, user.id) as ContinueReel | undefined;
-  const batchCount = Number((await db.prepare("SELECT COUNT(*) AS count FROM enrollments WHERE student_id = ? AND status = 'active'").get(user.id) as { count: number }).count);
-  const completedReels = Number((await db.prepare("SELECT COUNT(*) AS count FROM reel_progress WHERE student_id = ? AND completed = 1").get(user.id) as { count: number }).count);
+  const [subjectLinks, classProgress, enrollments, reelProgress] = await Promise.all([
+    db.collection<{ student_id: number; subject_id: number }>("student_subjects").find({ student_id: user.id }).toArray(),
+    db.collection<ClassProgressDocument>("class_progress").find({ student_id: user.id }).sort({ updated_at: -1 }).toArray(),
+    db.collection<EnrollmentDocument>("enrollments").find({ student_id: user.id, status: "active" }).toArray(),
+    db.collection<ReelProgressDocument>("reel_progress").find({ student_id: user.id }).toArray(),
+  ]);
+  const [allSubjects, allClasses, allSeries] = await Promise.all([
+    db.collection<SubjectDocument>("subjects").find().toArray(),
+    db.collection<ClassDocument>("classes").find({ published: 1 }).toArray(),
+    db.collection<ReelSeriesDocument>("reel_series").find({ published: 1 }).sort({ created_at: -1 }).toArray(),
+  ]);
+  const subjectNames = new Map(allSubjects.map((subject) => [subject.id, subject.name]));
+  const subjects = subjectLinks
+    .map((link) => ({ id: link.subject_id, name: subjectNames.get(link.subject_id) ?? "" }))
+    .filter((subject) => subject.name)
+    .sort((left, right) => left.name.localeCompare(right.name));
+  const accessibleBatchIds = new Set(enrollments.map((enrollment) => enrollment.batch_id));
+  const classesById = new Map(allClasses
+    .filter((item) => item.batch_id === null || accessibleBatchIds.has(item.batch_id))
+    .map((item) => [item.id, item]));
+  const classes: ContinueClass[] = classProgress.flatMap((progress) => {
+    const item = classesById.get(progress.class_id);
+    const subject = item ? subjectNames.get(item.subject_id) : undefined;
+    return item && subject ? [{
+      id: item.id,
+      title: item.title,
+      subject,
+      position_seconds: progress.position_seconds,
+    }] : [];
+  }).slice(0, 3);
+  const seriesById = new Map(allSeries
+    .filter((series) => series.batch_id === null || accessibleBatchIds.has(series.batch_id))
+    .map((series) => [series.id, series]));
+  const reelProgressById = new Map(reelProgress.map((progress) => [progress.reel_id, progress]));
+  const seriesIds = [...seriesById.keys()];
+  const availableReels = seriesIds.length
+    ? await db.collection<ReelDocument>("reels")
+      .find({ series_id: { $in: seriesIds }, published: 1 })
+      .toArray()
+    : [];
+  const seriesOrder = new Map(seriesIds.map((id, index) => [id, index]));
+  availableReels.sort((left, right) =>
+    (seriesOrder.get(left.series_id) ?? Number.MAX_SAFE_INTEGER)
+      - (seriesOrder.get(right.series_id) ?? Number.MAX_SAFE_INTEGER)
+    || left.sequence_number - right.sequence_number);
+  const next = availableReels.find((reel) => !reelProgressById.get(reel.id)?.completed);
+  const nextSeries = next ? seriesById.get(next.series_id) : undefined;
+  const nextReel: ContinueReel | undefined = next && nextSeries
+    ? {
+        id: next.id,
+        title: next.title,
+        sequence_number: next.sequence_number,
+        series_id: nextSeries.id,
+        series: nextSeries.title,
+        position_seconds: reelProgressById.get(next.id)?.position_seconds ?? 0,
+      }
+    : undefined;
+  const batchCount = enrollments.length;
+  const completedReels = reelProgress.filter((progress) => progress.completed === 1).length;
 
   return (
     <>

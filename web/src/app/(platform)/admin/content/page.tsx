@@ -4,30 +4,62 @@ import { togglePublication } from "@/lib/actions";
 import { EmptyState, PageHeading, PageMessages } from "@/components/ui";
 import { requireUser } from "@/lib/auth";
 import { getDb } from "@/lib/db";
+import type { ClassDocument, ReelDocument, ReelSeriesDocument, SubjectDocument, UserDocument } from "@/lib/models";
 
 type ContentItem = { kind: "Class" | "Series" | "Reel"; id: number; title: string; subject: string; owner: string; published: number; detail: string };
 
 export default async function AdminContentPage() {
   await requireUser(["admin"]);
   const db = getDb();
-  const classes = await db.prepare(`
-    SELECT classes.id, classes.title, subjects.name AS subject, users.name AS owner, classes.published,
-      'Full-length class' AS detail FROM classes
-    JOIN subjects ON subjects.id = classes.subject_id JOIN users ON users.id = classes.teacher_id
-  `).all() as Omit<ContentItem, "kind">[];
-  const series = await db.prepare(`
-    SELECT reel_series.id, reel_series.title, subjects.name AS subject, users.name AS owner, reel_series.published,
-      COUNT(reels.id) || ' reels in series' AS detail FROM reel_series
-    JOIN subjects ON subjects.id = reel_series.subject_id JOIN users ON users.id = reel_series.teacher_id
-    LEFT JOIN reels ON reels.series_id = reel_series.id
-    GROUP BY reel_series.id, reel_series.title, subjects.name, users.name, reel_series.published
-  `).all() as Omit<ContentItem, "kind">[];
-  const reels = await db.prepare(`
-    SELECT reels.id, reels.title, subjects.name AS subject, users.name AS owner, reels.published,
-      'Episode ' || reels.sequence_number || ' · ' || reel_series.title AS detail
-    FROM reels JOIN reel_series ON reel_series.id = reels.series_id
-    JOIN subjects ON subjects.id = reel_series.subject_id JOIN users ON users.id = reel_series.teacher_id
-  `).all() as Omit<ContentItem, "kind">[];
+  const [classDocs, seriesDocs, reelDocs, subjectDocs, userDocs] = await Promise.all([
+    db.collection<ClassDocument>("classes").find().toArray(),
+    db.collection<ReelSeriesDocument>("reel_series").find().toArray(),
+    db.collection<ReelDocument>("reels").find().toArray(),
+    db.collection<SubjectDocument>("subjects").find().toArray(),
+    db.collection<UserDocument>("users").find().toArray(),
+  ]);
+  const subjects = new Map(subjectDocs.map((subject) => [subject.id, subject.name]));
+  const teachers = new Map(userDocs.map((user) => [user.id, user.name]));
+  const reelCounts = new Map<number, number>();
+  for (const reel of reelDocs) reelCounts.set(reel.series_id, (reelCounts.get(reel.series_id) ?? 0) + 1);
+  const classes = classDocs.flatMap((item) => {
+    const subject = subjects.get(item.subject_id);
+    const owner = teachers.get(item.teacher_id);
+    return subject && owner ? [{
+      id: item.id,
+      title: item.title,
+      subject,
+      owner,
+      published: item.published,
+      detail: "Full-length class",
+    }] : [];
+  });
+  const series = seriesDocs.flatMap((item) => {
+    const subject = subjects.get(item.subject_id);
+    const owner = teachers.get(item.teacher_id);
+    return subject && owner ? [{
+      id: item.id,
+      title: item.title,
+      subject,
+      owner,
+      published: item.published,
+      detail: `${reelCounts.get(item.id) ?? 0} reels in series`,
+    }] : [];
+  });
+  const seriesById = new Map(seriesDocs.map((item) => [item.id, item]));
+  const reels = reelDocs.flatMap((item) => {
+    const parent = seriesById.get(item.series_id);
+    const subject = parent ? subjects.get(parent.subject_id) : undefined;
+    const owner = parent ? teachers.get(parent.teacher_id) : undefined;
+    return parent && subject && owner ? [{
+      id: item.id,
+      title: item.title,
+      subject,
+      owner,
+      published: item.published,
+      detail: `Episode ${item.sequence_number} · ${parent.title}`,
+    }] : [];
+  });
   const content: ContentItem[] = [
     ...classes.map((item) => ({ ...item, kind: "Class" as const })),
     ...series.map((item) => ({ ...item, kind: "Series" as const })),

@@ -7,8 +7,8 @@ import { getSubjects } from "@/lib/queries";
 
 export default async function SubjectsPage() {
   const user = await requireUser(["student"]);
-  const selected = await getDb().prepare("SELECT subject_id FROM student_subjects WHERE student_id = ?")
-    .all(user.id) as Array<{ subject_id: number }>;
+  const selected = await getDb().collection<{ student_id: number; subject_id: number }>("student_subjects")
+    .find({ student_id: user.id }, { projection: { subject_id: 1 } }).toArray();
   const subjects = await getSubjects();
   if (!subjects.length) redirect("/dashboard?error=No%20subjects%20are%20available%20yet");
   return (

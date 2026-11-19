@@ -1,14 +1,16 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { provisionFirstAdmin } from "@/lib/actions";
-import { getDb } from "@/lib/db";
+import { initializeDatabase } from "@/lib/db";
+import { countDocuments } from "@/lib/queries";
 import { Field, PageMessages } from "@/components/ui";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export default async function SetupPage() {
-  const count = Number((await getDb().prepare("SELECT COUNT(*) AS count FROM users").get() as { count: number | string }).count);
+  await initializeDatabase();
+  const count = await countDocuments("users");
   if (count) redirect("/login");
   return (
     <main className="auth-page">

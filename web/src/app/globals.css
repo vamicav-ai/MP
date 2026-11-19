@@ -479,7 +479,7 @@ button:disabled { cursor: not-allowed; }
 @media (max-width: 790px) {
   .sidebar { width: 70px; align-items: center; padding: 17px 8px 12px; }
   .brand { gap: 0; }
-  .brand > span:last-child, .workspace-label, .nav-link span, .help-card, .user-mini-copy, .user-mini form { display: none; }
+  .brand > span:last-child, .workspace-label, .nav-link span, .help-card, .user-mini-copy { display: none; }
   .side-nav { width: 100%; margin-top: 32px; }
   .nav-link { justify-content: center; padding: 0; }
   .user-mini { justify-content: center; border-top: 0; padding-top: 10px; }

@@ -28,7 +28,7 @@ export default async function RegisterPage() {
           <button className="button button-primary button-full" type="submit">Create my account <span>→</span></button>
         </form>
         <p className="auth-switch">Already have an account? <Link href="/login">Sign in</Link></p>
-        <p className="auth-footnote">We’ll send a verification link to your email before you can sign in. Use EduReels respectfully and keep your sign-in secure.</p>
+        <p className="auth-footnote">You’ll be signed in as soon as your account is created. Keep your password safe.</p>
       </section>
       <div className="auth-caption">LEARN SOMETHING NEW, EVERY DAY.</div>
     </main>

@@ -3,26 +3,48 @@ import { ArrowRight, Clapperboard, Play } from "lucide-react";
 import { EmptyState, PageHeading, PageMessages } from "@/components/ui";
 import { requireUser } from "@/lib/auth";
 import { getDb } from "@/lib/db";
+import type {
+  EnrollmentDocument,
+  ReelDocument,
+  ReelProgressDocument,
+  ReelSeriesDocument,
+  SubjectDocument,
+  UserDocument,
+} from "@/lib/models";
 
 type Series = { id: number; title: string; topic: string; subject: string; teacher: string; reel_count: number; completed_count: number };
 
 export default async function ReelsPage() {
   const user = await requireUser(["student"]);
-  const series = await getDb().prepare(`
-    SELECT reel_series.id, reel_series.title, reel_series.topic, subjects.name AS subject, users.name AS teacher,
-      COUNT(reels.id) AS reel_count,
-      SUM(CASE WHEN COALESCE(reel_progress.completed, 0) = 1 THEN 1 ELSE 0 END) AS completed_count
-    FROM reel_series JOIN subjects ON subjects.id = reel_series.subject_id
-    JOIN users ON users.id = reel_series.teacher_id
-    JOIN reels ON reels.series_id = reel_series.id AND reels.published = 1
-    LEFT JOIN reel_progress ON reel_progress.reel_id = reels.id AND reel_progress.student_id = ?
-    WHERE reel_series.published = 1
-      AND (reel_series.batch_id IS NULL OR EXISTS (
-        SELECT 1 FROM enrollments WHERE student_id = ? AND batch_id = reel_series.batch_id AND status = 'active'
-      ))
-    GROUP BY reel_series.id, reel_series.title, reel_series.topic, subjects.name, users.name, reel_series.created_at
-    ORDER BY reel_series.created_at DESC
-  `).all(user.id, user.id) as Series[];
+  const db = getDb();
+  const [seriesDocs, subjectDocs, userDocs, reels, progressDocs, enrollments] = await Promise.all([
+    db.collection<ReelSeriesDocument>("reel_series").find({ published: 1 }).sort({ created_at: -1 }).toArray(),
+    db.collection<SubjectDocument>("subjects").find().toArray(),
+    db.collection<UserDocument>("users").find().toArray(),
+    db.collection<ReelDocument>("reels").find({ published: 1 }).toArray(),
+    db.collection<ReelProgressDocument>("reel_progress").find({ student_id: user.id }).toArray(),
+    db.collection<EnrollmentDocument>("enrollments").find({ student_id: user.id, status: "active" }).toArray(),
+  ]);
+  const subjects = new Map(subjectDocs.map((subject) => [subject.id, subject.name]));
+  const teachers = new Map(userDocs.map((teacher) => [teacher.id, teacher.name]));
+  const progressByReel = new Map(progressDocs.map((progress) => [progress.reel_id, progress.completed]));
+  const accessibleBatchIds = new Set(enrollments.map((enrollment) => enrollment.batch_id));
+  const series: Series[] = seriesDocs.flatMap((item) => {
+    if (item.batch_id !== null && !accessibleBatchIds.has(item.batch_id)) return [];
+    const subject = subjects.get(item.subject_id);
+    const teacher = teachers.get(item.teacher_id);
+    const seriesReels = reels.filter((reel) => reel.series_id === item.id);
+    if (!subject || !teacher || !seriesReels.length) return [];
+    return [{
+      id: item.id,
+      title: item.title,
+      topic: item.topic,
+      subject,
+      teacher,
+      reel_count: seriesReels.length,
+      completed_count: seriesReels.filter((reel) => progressByReel.get(reel.id) === 1).length,
+    }];
+  });
   return (
     <>
       <PageMessages />
